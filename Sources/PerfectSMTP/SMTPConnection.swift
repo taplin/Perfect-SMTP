@@ -1,0 +1,332 @@
+//
+//  SMTPConnection.swift
+//  PerfectSMTP
+//
+//  Phase B of the two-phase channel lifecycle (plan §4.3): native
+//  async/await, no hand-rolled correlation at all. Once bootstrap (Phase A)
+//  hands back a pipeline-clean `NIOAsyncChannel<SMTPReply, SMTPCommand>`,
+//  everything from EHLO onward — capability re-negotiation, AUTH's SASL
+//  exchange (including the `async` token-refresh callback), MAIL/RCPT/DATA,
+//  PIPELINING — is driven as a plain `for try await reply in inboundStream`
+//  loop paired with `try await outboundWriter.write(command)`. SMTP replies
+//  are guaranteed to arrive in the same order commands were issued (RFC
+//  2920 §3, including under PIPELINING), so this needs no shared
+//  correlation structure: this object's owning task is the only reader and
+//  the only writer, sequentially, within one `async` function.
+//
+
+import Foundation
+import NIOCore
+
+/// Errors specific to driving a live Phase-B conversation (as opposed to
+/// `SMTPError`, which classifies SMTP-level replies).
+public enum SMTPConnectionError: Error, Sendable, Equatable {
+    /// The `NIOAsyncChannel` inbound sequence ended (channel closed) while
+    /// a reply was still expected.
+    case channelClosedByPeer
+    /// A `334` continuation reply's text wasn't valid base64.
+    case malformedSASLChallenge
+}
+
+/// The live, TLS-ready connection's async conversation surface.
+///
+/// `@unchecked Sendable`: used by a single connection-owning task at a
+/// time — the connection pool (`SMTPConnectionPool`) enforces
+/// checkout/release exclusivity (plan §4.4's "connections never cross
+/// tasks"), matching PerfectNIO's `AsyncWebSocket` precedent (single-task
+/// ownership, not internal synchronization, is the safety argument).
+///
+/// Long-lived across many pool checkouts, so this deliberately does **not**
+/// use `NIOAsyncChannel.executeThenClose` (which closes the channel the
+/// moment its scoped closure returns — the wrong lifetime for a pooled,
+/// reused connection). It instead uses the (deprecated, but still
+/// functional) `NIOAsyncChannel.inbound`/`.outbound` accessors once, at
+/// construction, to obtain a persistent iterator/writer pair that outlives
+/// any single call — the documented replacement (`executeThenClose`)
+/// assumes a request-scoped lifetime that connection pooling doesn't have.
+/// This is a deliberate, documented judgment call (see the Phase 1 report).
+public final class SMTPConnection: @unchecked Sendable {
+    /// Exposed for the pool's liveness checks (`channel.isActive`) and for
+    /// closing a connection being evicted.
+    public let channel: Channel
+
+    private var iterator: NIOAsyncChannelInboundStream<SMTPReply>.AsyncIterator
+    private let outbound: NIOAsyncChannelOutboundWriter<SMTPCommand>
+    public private(set) var capabilities: Capabilities
+    public let ehloHostname: String
+
+    public init(asyncChannel: NIOAsyncChannel<SMTPReply, SMTPCommand>, ehloHostname: String) {
+        self.channel = asyncChannel.channel
+        // Intentional use of the unscoped, deprecated `.inbound`/`.outbound`
+        // accessors -- see this type's doc comment for why
+        // `executeThenClose`'s request-scoped lifetime doesn't fit a
+        // pooled, reused connection. The two deprecation warnings below are
+        // deliberately left visible rather than suppressed, as an honest
+        // signal of this judgment call to anyone reading build output.
+        self.iterator = asyncChannel.inbound.makeAsyncIterator()
+        self.outbound = asyncChannel.outbound
+        self.capabilities = Capabilities()
+        self.ehloHostname = ehloHostname
+    }
+
+    /// Reads the next reply, or throws if the connection closed
+    /// mid-conversation (plan §4.3's "mid-conversation disconnect" —
+    /// `NIOAsyncChannel`'s inbound sequence terminating on channel close
+    /// surfaces here as a normal thrown error by construction, no special
+    /// handling needed).
+    public func nextReply() async throws -> SMTPReply {
+        guard let reply = try await iterator.next() else {
+            throw SMTPConnectionError.channelClosedByPeer
+        }
+        return reply
+    }
+
+    public func write(_ command: SMTPCommand) async throws {
+        try await outbound.write(command)
+    }
+
+    public func writeLine(_ line: String) async throws {
+        try await write(.line(line))
+    }
+
+    /// Phase B's first command (plan §4.3 step 7): EHLO, with a HELO
+    /// fallback when the server doesn't understand EHLO at all.
+    @discardableResult
+    public func negotiateCapabilities() async throws -> Capabilities {
+        try await writeLine("EHLO \(ehloHostname)")
+        let reply = try await nextReply()
+        if reply.replyClass == .permanentNegative {
+            try await writeLine("HELO \(ehloHostname)")
+            let heloReply = try await nextReply()
+            guard heloReply.replyClass == .positiveCompletion else {
+                throw SMTPError.classify(heloReply)
+            }
+            capabilities = Capabilities()
+            return capabilities
+        }
+        guard reply.replyClass == .positiveCompletion else {
+            throw SMTPError.classify(reply)
+        }
+        capabilities = Capabilities(parsingEHLOLines: reply.lines)
+        return capabilities
+    }
+
+    // MARK: - AUTH (plan §4.5)
+
+    /// Tracks whether this connection has already completed an AUTH
+    /// exchange — a pooled connection is reused across many checkouts, and
+    /// most servers reject a second `AUTH` on an already-authenticated
+    /// session (typically `503 5.5.1 already authenticated`); callers
+    /// (e.g. `RelayTransport`) should check this before calling
+    /// `authenticate(_:)` again on a connection they didn't just dial.
+    public private(set) var isAuthenticated = false
+
+    public func authenticate(_ mechanism: any SASLMechanism) async throws {
+        guard capabilities.authMechanisms.contains(mechanism.name) else {
+            throw SMTPError.authenticationFailed(
+                SMTPReply(code: 504, lines: ["Unsupported AUTH mechanism \(mechanism.name)"])
+            )
+        }
+        var attempt = mechanism
+        do {
+            try await performSASLExchange(&attempt)
+        } catch let error as SMTPError {
+            guard case .authenticationFailed = error, let xoauth2 = mechanism as? XOAuth2 else { throw error }
+            // XOAuth2-specific retry (plan §4.5): call tokenProvider() again
+            // and retry once. A fresh `XOAuth2` value (same tokenProvider
+            // closure) naturally re-invokes it during the retried exchange
+            // -- no separate refresh hook needed on the protocol.
+            var retry: any SASLMechanism = XOAuth2(username: xoauth2.username, tokenProvider: xoauth2.tokenProvider)
+            try await performSASLExchange(&retry)
+            isAuthenticated = true
+            return
+        }
+        isAuthenticated = true
+    }
+
+    private func performSASLExchange(_ mechanism: inout any SASLMechanism) async throws {
+        let initial = try await mechanism.initialResponse()
+        var line = "AUTH \(mechanism.name)"
+        if let initial {
+            line += " \(Data(initial).base64EncodedString())"
+        }
+        try await writeLine(line)
+        var reply = try await nextReply()
+        while reply.code == 334 {
+            guard let challengeText = reply.lines.first,
+                  let challengeData = Data(base64Encoded: challengeText)
+            else {
+                throw SMTPConnectionError.malformedSASLChallenge
+            }
+            let response = try await mechanism.respond(to: Array(challengeData))
+            try await writeLine(Data(response).base64EncodedString())
+            reply = try await nextReply()
+        }
+        guard reply.replyClass == .positiveCompletion else {
+            throw SMTPError.authenticationFailed(reply)
+        }
+    }
+
+    // MARK: - Mail transaction (plan §4.3's PIPELINING semantics)
+
+    /// Sends one message to `envelope.recipients`, returning one
+    /// `DeliveryResult` per recipient. Uses PIPELINING when advertised;
+    /// degrades to lock-step (await each reply before the next write) when
+    /// absent — the same command sequence either way.
+    public func sendMessage(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
+        var mailFromLine = try envelope.mailFrom.mailFromCommand
+        if capabilities.sizeAdvertised {
+            mailFromLine += " SIZE=\(message.estimatedSize)"
+        }
+        let recipientLines = try envelope.recipients.map { recipient -> String in
+            let validated = try HeaderEncoder.rejectHeaderInjection(recipient, field: "RCPT TO address")
+            return "RCPT TO:<\(validated)>"
+        }
+
+        if capabilities.pipelining {
+            return try await sendPipelined(
+                mailFromLine: mailFromLine, recipientLines: recipientLines,
+                recipients: envelope.recipients, message: message
+            )
+        }
+        return try await sendLockStep(
+            mailFromLine: mailFromLine, recipientLines: recipientLines,
+            recipients: envelope.recipients, message: message
+        )
+    }
+
+    private func sendLockStep(
+        mailFromLine: String, recipientLines: [String], recipients: [String], message: SignedMessage
+    ) async throws -> [DeliveryResult] {
+        try await writeLine(mailFromLine)
+        let mailReply = try await nextReply()
+        guard mailReply.replyClass == .positiveCompletion else {
+            throw classifyMailFromFailure(mailReply)
+        }
+
+        var results: [DeliveryResult] = []
+        var anyAccepted = false
+        for (recipient, line) in zip(recipients, recipientLines) {
+            try await writeLine(line)
+            let reply = try await nextReply()
+            if reply.replyClass == .positiveCompletion {
+                anyAccepted = true
+                results.append(DeliveryResult(recipient: recipient, outcome: .delivered(reply)))
+            } else {
+                results.append(DeliveryResult(recipient: recipient, outcome: outcomeFor(reply)))
+            }
+        }
+        guard anyAccepted else { return results }
+
+        try await writeLine("DATA")
+        let dataReply = try await nextReply()
+        guard dataReply.code == 354 else {
+            let fallback = outcomeFor(dataReply)
+            return remapAccepted(results, to: fallback)
+        }
+
+        return try await sendBodyAndFinalize(message, results: results)
+    }
+
+    private func sendPipelined(
+        mailFromLine: String, recipientLines: [String], recipients: [String], message: SignedMessage
+    ) async throws -> [DeliveryResult] {
+        try await writeLine(mailFromLine)
+        for line in recipientLines { try await writeLine(line) }
+        try await writeLine("DATA")
+
+        let mailReply = try await nextReply()
+        guard mailReply.replyClass == .positiveCompletion else {
+            // The server will still reply to every pipelined command it
+            // already received even though MAIL FROM failed -- drain them
+            // to stay in sync with RFC 2920 §3's in-order-reply guarantee
+            // before surfacing the failure.
+            for _ in recipientLines { _ = try? await nextReply() }
+            _ = try? await nextReply()
+            throw classifyMailFromFailure(mailReply)
+        }
+
+        var results: [DeliveryResult] = []
+        var anyAccepted = false
+        for recipient in recipients {
+            let reply = try await nextReply()
+            if reply.replyClass == .positiveCompletion {
+                anyAccepted = true
+                results.append(DeliveryResult(recipient: recipient, outcome: .delivered(reply)))
+            } else {
+                results.append(DeliveryResult(recipient: recipient, outcome: outcomeFor(reply)))
+            }
+        }
+
+        let dataReply = try await nextReply()
+        // DATA proceeds only if at least one RCPT was accepted -- otherwise
+        // the pipelined DATA command itself draws a rejection and the body
+        // must never be sent (plan §4.3's corrected PIPELINING semantics).
+        guard anyAccepted, dataReply.code == 354 else {
+            let fallback = outcomeFor(dataReply)
+            return remapAccepted(results, to: fallback)
+        }
+
+        return try await sendBodyAndFinalize(message, results: results)
+    }
+
+    private func sendBodyAndFinalize(
+        _ message: SignedMessage, results: [DeliveryResult]
+    ) async throws -> [DeliveryResult] {
+        try await write(.raw(DotStuffing.encode(message.rfc5322)))
+        // The point of no return (plan §4.8): after the DATA payload is
+        // sent, before the final reply arrives. A failure in this exact
+        // window is `.ambiguous` and must never be auto-retried.
+        let finalOutcome: DeliveryResult.Outcome
+        do {
+            let finalReply = try await nextReply()
+            finalOutcome = finalReply.replyClass == .positiveCompletion
+                ? .delivered(finalReply) : outcomeFor(finalReply)
+        } catch {
+            finalOutcome = .ambiguous(nil)
+        }
+        return remapAccepted(results, to: finalOutcome)
+    }
+
+    /// Replaces every tentatively-`.delivered` (i.e. RCPT-accepted) result
+    /// with `outcome` — the actual outcome is only known once the DATA
+    /// phase's single final reply arrives, since SMTP has one server reply
+    /// covering every accepted recipient, not one per recipient.
+    private func remapAccepted(_ results: [DeliveryResult], to outcome: DeliveryResult.Outcome) -> [DeliveryResult] {
+        results.map { result in
+            if case .delivered = result.outcome {
+                return DeliveryResult(recipient: result.recipient, outcome: outcome)
+            }
+            return result
+        }
+    }
+
+    private func classifyMailFromFailure(_ reply: SMTPReply) -> SMTPError {
+        if reply.code == 552 {
+            return .sizeExceeded(limit: capabilities.size ?? 0)
+        }
+        return SMTPError.classify(reply)
+    }
+
+    /// Phase 1's job is correct single-attempt classification, not a full
+    /// retry scheduler (plan §4.8's explicit scope boundary — the actual
+    /// scheduling/execution of retries is Phase 3 territory). The backoff
+    /// durations below are placeholders populating `DeliveryResult`'s
+    /// existing `.queuedForRetry(nextAttempt:...)` shape correctly (per the
+    /// 421-vs-greylist distinction) so callers see a sensible "retry no
+    /// sooner than" hint even though nothing in Phase 1 acts on it yet.
+    private func outcomeFor(_ reply: SMTPReply) -> DeliveryResult.Outcome {
+        switch reply.replyClass {
+        case .permanentNegative:
+            return .permanentlyFailed(reply)
+        default:
+            let backoff: TimeInterval
+            switch SMTPError.classify(reply) {
+            case .serviceUnavailable: backoff = 900
+            case .greylisted: backoff = 300
+            default: backoff = 120
+            }
+            return .queuedForRetry(nextAttempt: Date().addingTimeInterval(backoff), attempt: 1, last: reply)
+        }
+    }
+}

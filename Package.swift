@@ -30,11 +30,10 @@ let package = Package(
             dependencies: ["PerfectSMTPCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
-        // Transport layer target. Phase 0 ships only a re-export stub;
-        // channel handlers, the protocol state machine, the connection-pool
-        // actor, Transport strategies, and SMTPMailer's public API land in
-        // Phase 1. The NIO/NIOSSL/Logging dependencies are declared now so
-        // Phase 1 can start immediately without a Package.swift churn.
+        // Transport layer target. Channel handlers, the protocol state
+        // machine, the connection-pool actor, Transport strategies, and
+        // SMTPMailer's public API land here starting Phase 1 (see
+        // Documentation/swift6-nio-rewrite-plan.md §9).
         .target(
             name: "PerfectSMTP",
             dependencies: [
@@ -43,13 +42,17 @@ let package = Package(
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "NIOTLS", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
             name: "PerfectSMTPTests",
-            dependencies: ["PerfectSMTP"],
+            dependencies: [
+                "PerfectSMTP",
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

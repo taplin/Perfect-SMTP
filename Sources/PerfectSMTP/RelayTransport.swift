@@ -1,0 +1,89 @@
+//
+//  RelayTransport.swift
+//  PerfectSMTP
+//
+//  Plan §3/§4.2: network handoff to an already-operated MTA — scope
+//  explicitly includes both commercial ESPs (SendGrid/Postmark/SES, with
+//  AUTH) and self-hosted/internal MTAs reachable over the network
+//  (possibly with no AUTH at all, on a trusted network). Same NIO-based
+//  client either way, just configuration; owns a `SMTPConnectionPool`
+//  keyed to one configured host.
+//
+
+import NIOCore
+
+public struct RelayConfig: Sendable {
+    public enum Auth: Sendable {
+        case none
+        case plain(username: String, password: String)
+        case login(username: String, password: String)
+        case xoauth2(username: String, tokenProvider: @Sendable () async throws -> String)
+    }
+
+    public var host: String
+    public var port: Int
+    public var tls: TLSMode
+    public var auth: Auth
+    public var ehloHostname: String
+    public var pool: SMTPConnectionPool.Configuration
+
+    public init(
+        host: String,
+        port: Int,
+        tls: TLSMode,
+        auth: Auth = .none,
+        ehloHostname: String = "localhost",
+        pool: SMTPConnectionPool.Configuration = .init()
+    ) {
+        self.host = host
+        self.port = port
+        self.tls = tls
+        self.auth = auth
+        self.ehloHostname = ehloHostname
+        self.pool = pool
+    }
+
+    var mechanism: (any SASLMechanism)? {
+        switch auth {
+        case .none: return nil
+        case .plain(let username, let password): return SASLPlain(username: username, password: password)
+        case .login(let username, let password): return SASLLogin(username: username, password: password)
+        case .xoauth2(let username, let tokenProvider): return XOAuth2(username: username, tokenProvider: tokenProvider)
+        }
+    }
+}
+
+/// A `SMTPTransport` that submits to one configured SMTP host via a pooled,
+/// possibly-authenticated connection. `RelayTransport` owns its pool; each
+/// `send(_:_:)` call checks out a connection, authenticates it once (pool
+/// connections are dialed already-EHLO'd — see `SMTPConnectionPool`'s
+/// dialer — so only AUTH remains here, and only on a freshly-dialed
+/// connection, tracked via the pool's own connection reuse), and hands the
+/// transaction to `SMTPConnection.sendMessage(_:_:)`.
+public final class RelayTransport: SMTPTransport, Sendable {
+    private let config: RelayConfig
+    private let pool: SMTPConnectionPool
+    private let key: SMTPConnectionPool.Key
+
+    public init(config: RelayConfig, group: any EventLoopGroup) {
+        self.config = config
+        self.pool = SMTPConnectionPool(configuration: config.pool, ehloHostname: config.ehloHostname, group: group)
+        self.key = SMTPConnectionPool.Key(host: config.host, port: config.port, tls: config.tls)
+    }
+
+    public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
+        try await pool.withConnection(to: key) { connection in
+            // A pooled connection is reused across many checkouts; only
+            // authenticate once per connection (most servers reject a
+            // second AUTH on an already-authenticated session).
+            if !connection.isAuthenticated, let mechanism = self.config.mechanism {
+                try await connection.authenticate(mechanism)
+            }
+            return try await connection.sendMessage(envelope, message)
+        }
+    }
+
+    public func shutdown() async {
+        await pool.shutdown()
+    }
+}
