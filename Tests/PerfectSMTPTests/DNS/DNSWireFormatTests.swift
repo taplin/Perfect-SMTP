@@ -323,4 +323,110 @@ struct DNSWireFormatTests {
     private func pointerBytes(to offset: Int) -> [UInt8] {
         [UInt8(0xC0 | (offset >> 8)), UInt8(offset & 0xFF)]
     }
+
+    // MARK: - TXT records (plan §9 Phase 4: MTA-STS discovery, RFC 1035 §3.3.14)
+    //
+    // Hand-crafted rather than captured -- `DNSTestFixtures.swift`'s header
+    // comment documents how the other fixtures in this file were captured
+    // from a live nameserver, but a synthetic `_mta-sts.<domain>` TXT
+    // record is simpler and just as faithful to the wire format here, and
+    // lets these tests exercise the exact single-string/multi-string/
+    // truncation shapes that matter for RFC 8461 §3.1 discovery without
+    // depending on any particular real domain still publishing one at
+    // capture time.
+
+    @Test func decodesATXTRecordCarryingAnMTASTSDiscoveryString() throws {
+        let value = "v=STSv1; id=20160831085700Z"
+        let message = try DNSMessage.decode(txtResponse(name: "_mta-sts.example.com", strings: [value]))
+        #expect(message.answers.count == 1)
+        guard case .txt(let strings) = message.answers[0].rdata else {
+            Issue.record("expected a TXT record, got \(message.answers[0].rdata)")
+            return
+        }
+        #expect(strings == [value])
+    }
+
+    @Test func decodesATXTRecordWithMultipleCharacterStringsAsSeparateEntries() throws {
+        // RFC 1035 §3.3.14: RDATA is one-or-more `<character-string>`s
+        // packed back-to-back -- this decoder must preserve them as
+        // separate strings (concatenation, if any, is `DNSResolver
+        // .resolveTXT`'s job, not this codec's), matching the header
+        // comment on `DNSRDATA.txt`.
+        let message = try DNSMessage.decode(txtResponse(name: "example.com", strings: ["v=STSv1; ", "id=abc123"]))
+        #expect(message.answers.count == 1)
+        guard case .txt(let strings) = message.answers[0].rdata else {
+            Issue.record("expected a TXT record, got \(message.answers[0].rdata)")
+            return
+        }
+        #expect(strings == ["v=STSv1; ", "id=abc123"])
+    }
+
+    @Test func decodesAnEmptyTXTRecordAsNoCharacterStringsRatherThanThrowing() throws {
+        let message = try DNSMessage.decode(txtResponse(name: "example.com", strings: []))
+        guard case .txt(let strings) = message.answers[0].rdata else {
+            Issue.record("expected a TXT record, got \(message.answers[0].rdata)")
+            return
+        }
+        #expect(strings.isEmpty)
+    }
+
+    @Test func txtRecordWithALengthByteRunningPastRDLENGTHThrowsTruncatedRatherThanReadingOOB() {
+        var bytes = minimalHeaderAndQuestion(name: "example.com", qtype: DNSRecordType.txt.rawValue, answerCount: 1)
+        // Owner name: a compression pointer back at the question (0xc00c).
+        bytes += [0xC0, 0x0C]
+        bytes += [0x00, 0x10] // TYPE = TXT (16)
+        bytes += [0x00, 0x01] // CLASS = IN
+        bytes += [0x00, 0x00, 0x00, 0x00] // TTL
+        bytes += [0x00, 0x02] // RDLENGTH = 2
+        // RDATA: a length byte claiming 200 bytes follow, but RDLENGTH
+        // only reserves 2 bytes total (the length byte itself plus one
+        // more) -- must fail closed, never read past `rdataEnd`.
+        bytes += [200, 0x41]
+        #expect(throws: DNSWireError.truncated) {
+            _ = try DNSMessage.decode(bytes)
+        }
+    }
+
+    /// Builds a minimal, well-formed DNS response message: one question
+    /// (`name`, type `qtype`, class IN) and, if `strings` is non-`nil`, one
+    /// matching TXT answer record whose owner name is a compression
+    /// pointer back at the question (mirroring the real captured fixtures'
+    /// own compression usage elsewhere in this file).
+    private func txtResponse(name: String, strings: [String]) -> [UInt8] {
+        var bytes = minimalHeaderAndQuestion(name: name, qtype: DNSRecordType.txt.rawValue, answerCount: 1)
+        bytes += [0xC0, 0x0C] // owner name: pointer back at the question
+        bytes += [0x00, 0x10] // TYPE = TXT
+        bytes += [0x00, 0x01] // CLASS = IN
+        bytes += [0x00, 0x00, 0x00, 0x00] // TTL
+        var rdata: [UInt8] = []
+        for string in strings {
+            let characterBytes = Array(string.utf8)
+            rdata.append(UInt8(characterBytes.count))
+            rdata += characterBytes
+        }
+        bytes += [UInt8(rdata.count >> 8), UInt8(rdata.count & 0xFF)] // RDLENGTH
+        bytes += rdata
+        return bytes
+    }
+
+    /// A minimal 12-byte header (one question, `answerCount` answers,
+    /// NOERROR) followed by one question section for `(name, qtype, IN)`.
+    private func minimalHeaderAndQuestion(name: String, qtype: UInt16, answerCount: UInt16 = 0) -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes += [0x12, 0x34] // ID
+        bytes += [0x81, 0x80] // flags: QR=1, RD=1, RA=1, RCODE=0
+        bytes += [0x00, 0x01] // QDCOUNT = 1
+        bytes += [UInt8(answerCount >> 8), UInt8(answerCount & 0xFF)] // ANCOUNT
+        bytes += [0x00, 0x00] // NSCOUNT
+        bytes += [0x00, 0x00] // ARCOUNT
+        for label in name.split(separator: ".") {
+            let labelBytes = Array(label.utf8)
+            bytes.append(UInt8(labelBytes.count))
+            bytes += labelBytes
+        }
+        bytes.append(0x00) // root terminator
+        bytes += [UInt8(qtype >> 8), UInt8(qtype & 0xFF)] // QTYPE
+        bytes += [0x00, 0x01] // QCLASS = IN
+        return bytes
+    }
 }

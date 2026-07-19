@@ -74,12 +74,18 @@ public enum DNSWireError: Error, Sendable, Equatable {
 }
 
 /// The DNS record types `DNSResolver` understands. RFC 1035 §3.2.2 (A, CNAME),
-/// §3.3.9 (MX), RFC 3596 (AAAA). Any other on-the-wire TYPE value decodes into
-/// `DNSResourceRecord.RDATA.other` rather than one of this enum's cases.
+/// §3.3.9 (MX), §3.3.14 (TXT), RFC 3596 (AAAA). Any other on-the-wire TYPE
+/// value decodes into `DNSResourceRecord.RDATA.other` rather than one of this
+/// enum's cases.
+///
+/// `.txt` was added for plan §9 Phase 4 (MTA-STS policy discovery, RFC 8461
+/// §3.1: an `_mta-sts.<domain>` TXT record signals a policy might exist) --
+/// see `DNSRDATA.txt`'s doc comment for the decoded shape.
 public enum DNSRecordType: UInt16, Sendable, Equatable {
     case a = 1
     case cname = 5
     case mx = 15
+    case txt = 16
     case aaaa = 28
 }
 
@@ -131,6 +137,16 @@ public enum DNSRDATA: Sendable, Equatable {
     /// RFC 1035 §3.3.1, name-decompressed. `DNSResolver` follows this when
     /// resolving A/AAAA for a hostname that's actually an alias.
     case cname(String)
+    /// RFC 1035 §3.3.14: one or more length-prefixed `<character-string>`s
+    /// packed back-to-back in RDATA, decoded here as one `String` per
+    /// `<character-string>` (never concatenated by this decoder -- a
+    /// resource record's *caller*, e.g. plan §9 Phase 4's MTA-STS
+    /// discovery, decides whether/how to join multiple strings within one
+    /// record; RFC 8461's own `v=STSv1; id=...` value is conventionally a
+    /// single `<character-string>` in practice, but nothing here assumes
+    /// that). No name-compression applies to TXT-DATA (it's opaque text,
+    /// not a domain name).
+    case txt([String])
     case other(raw: [UInt8])
 }
 
@@ -325,6 +341,8 @@ public struct DNSMessage: Sendable, Equatable {
         case DNSRecordType.cname.rawValue:
             let (target, _) = try decodeName(bytes, at: rdataStart, messageJumpBudget: &messageJumpBudget)
             rdata = .cname(target)
+        case DNSRecordType.txt.rawValue:
+            rdata = .txt(try decodeCharacterStrings(bytes, from: rdataStart, to: rdataEnd))
         default:
             rdata = .other(raw: Array(bytes[rdataStart..<rdataEnd]))
         }
@@ -337,6 +355,29 @@ public struct DNSMessage: Sendable, Equatable {
         // record type (`.other`) be skipped correctly without this codec
         // knowing anything about its internal structure.
         return (record, rdataEnd)
+    }
+
+    /// Decodes a TXT record's RDATA (plan §9 Phase 4) as a sequence of RFC
+    /// 1035 §3.3 `<character-string>`s -- each one a single length octet
+    /// followed by that many bytes of opaque text, packed back-to-back with
+    /// no compression and no terminator, until exactly `rdataEnd` is
+    /// reached (RDLENGTH, not an embedded terminator, is what bounds this --
+    /// same discipline `decodeResourceRecord` already uses for every other
+    /// RDATA shape). A length byte that would read past `rdataEnd` is
+    /// `.truncated`, matching every other short-read case in this file
+    /// rather than introducing a TXT-specific error case for what's really
+    /// the same failure mode.
+    private static func decodeCharacterStrings(_ bytes: [UInt8], from rdataStart: Int, to rdataEnd: Int) throws -> [String] {
+        var strings: [String] = []
+        var offset = rdataStart
+        while offset < rdataEnd {
+            let length = Int(bytes[offset])
+            offset += 1
+            guard offset + length <= rdataEnd else { throw DNSWireError.truncated }
+            strings.append(String(decoding: bytes[offset..<offset + length], as: UTF8.self))
+            offset += length
+        }
+        return strings
     }
 
     /// Decodes one domain name starting at `offset`, following RFC 1035

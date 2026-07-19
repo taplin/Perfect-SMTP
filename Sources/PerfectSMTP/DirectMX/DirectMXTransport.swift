@@ -15,13 +15,58 @@
 //
 
 import Foundation
+import Logging
 import NIOCore
 
+/// The TLS policy `DirectMXTransport` applies when dialing a resolved MX
+/// host (plan §9 Phase 4). `DirectMXTransport` itself layers per-domain
+/// MTA-STS policy (RFC 8461 `testing`/`enforce`) on top of whichever of
+/// these two a `DirectMXConfig` is configured with -- see that type's own
+/// doc comments for exactly how `enforce`/`testing` interact with each
+/// case here.
+public enum DirectMXTLSPolicy: Sendable, Equatable {
+    /// Phase 3's exact original behavior, preserved as an explicit escape
+    /// hatch: every connection attempt against every resolved host uses
+    /// exactly this `TLSMode`, uniformly, with **no** opportunistic
+    /// fallback and **no** MTA-STS involvement at all -- even a domain
+    /// that publishes an `enforce` MTA-STS policy is delivered to exactly
+    /// as configured here, never restricted to policy-matching hosts. For
+    /// a caller who wants full manual control (e.g. mandatory STARTTLS
+    /// against every destination, explicitly accepting that domains
+    /// without STARTTLS become undeliverable-by-this-transport -- Phase
+    /// 3's own documented recipe for that) or who has their own reasons to
+    /// opt out of Phase 4's new default entirely.
+    case fixed(TLSMode)
+    /// **Phase 4's new default** (plan §9 Phase 4, point 4 -- closes the
+    /// gap Phase 3 explicitly deferred: "opportunistic TLS is Phase
+    /// 4/MTA-STS scope"). Per resolved MX host: try `TLSMode.startTLS`
+    /// first (mandatory-verified, real certificate/hostname checking, same
+    /// as `.startTLS` always does in this codebase); if the server's EHLO
+    /// doesn't advertise STARTTLS at all (bootstrap throws
+    /// `.starttlsRequired`) or the handshake itself fails for a genuine,
+    /// non-injection reason (a real NIOSSL/certificate/connection failure),
+    /// retry the *same host* with `TLSMode.none` instead of treating that
+    /// host as unreachable. **Never** falls back to plaintext after a
+    /// detected `SMTPError.starttlsInjection` -- see
+    /// `DirectMXTransport.deliverToDomain`'s opportunistic-attempt helper
+    /// for exactly where that distinction is enforced; an injection
+    /// detection on one host simply moves on to the next resolved MX host
+    /// (ordinary host-level fallback), never retries that same host
+    /// unauthenticated. When a domain publishes an MTA-STS `testing` or
+    /// `enforce` policy (and a `mtaSTSPolicyProvider` is configured), that
+    /// policy's stronger requirements apply on top of -- and, for
+    /// `enforce`'s mandatory-TLS-only/host-restriction rules, in place of
+    /// -- this opportunistic default for that specific domain; a domain
+    /// with no policy (or an explicit `mode: none` policy) gets exactly
+    /// the behavior described here.
+    case opportunistic
+}
+
 /// Configuration for one `DirectMXTransport` instance. Applies uniformly to
-/// every destination this transport connects to -- there is no per-domain
-/// override surface in this phase (e.g. a domain known to require TLS vs.
-/// one that doesn't; that policy layer is Phase 4's MTA-STS/DANE scope, not
-/// this one).
+/// every destination this transport connects to, modulated per-domain only
+/// by MTA-STS policy when a `mtaSTSPolicyProvider` is configured on
+/// `DirectMXTransport` (plan §9 Phase 4) -- there is no other per-domain
+/// override surface.
 ///
 /// **Security (FIX #2, milestone security review): this transport must not
 /// be exposed to untrusted recipient input without SSRF-class address
@@ -42,28 +87,22 @@ public struct DirectMXConfig: Sendable {
     /// universal port every receiving MX host listens on, not
     /// client-submission.
     public var port: Int
-    /// TLS policy applied to every direct-MX connection this transport
-    /// makes. **Deliberately `.none` by default** -- a documented judgment
-    /// call, not an oversight: `TLSMode.startTLS` in this codebase is
-    /// mandatory-once-requested (`SMTPBootstrapHandler` hard-fails with
-    /// `.starttlsRequired` if the peer's EHLO doesn't advertise it), which
-    /// is the wrong default for direct-MX delivery -- unlike a relay a
-    /// caller chose and configured, a direct-MX transport connects to
-    /// whatever MX host a domain happens to publish, and a meaningful
-    /// fraction of real-world MX hosts still don't advertise STARTTLS at
-    /// all. Defaulting to `.startTLS` here would silently turn "the
-    /// receiver doesn't support TLS" into "this domain is
-    /// undeliverable-by-this-transport", which is worse than the
-    /// unencrypted-hop status quo most direct-sending MTAs actually
-    /// operate under today. True opportunistic TLS (upgrade when
-    /// advertised, fall back to plaintext when not, harden via MTA-STS/DANE
-    /// policy) is explicitly Phase 4's scope (plan §9) -- this phase
-    /// supports whichever single `TLSMode` a caller configures uniformly,
-    /// same as `RelayTransport`, and a caller who wants mandatory STARTTLS
-    /// against every direct-MX destination can already get that by setting
-    /// `tls = .startTLS` here, accepting that domains without STARTTLS
-    /// become undeliverable until Phase 4 lands.
-    public var tls: TLSMode
+    /// TLS policy applied to every direct-MX destination this transport
+    /// connects to. **Phase 4 (plan §9) changes the default from Phase 3's
+    /// fixed `.none` to `.opportunistic`** -- see `DirectMXTLSPolicy
+    /// .opportunistic`'s doc comment for exactly what that means and why;
+    /// in short, this transport now *tries* STARTTLS by default wherever a
+    /// server advertises it, instead of never even attempting TLS unless a
+    /// caller explicitly configured it (Phase 3's own documented gap, left
+    /// open specifically for this phase to close -- see that phase's git
+    /// history / this property's prior doc comment, preserved in
+    /// `DirectMXTLSPolicy.fixed`'s doc comment for the caller who still
+    /// wants that exact Phase 3 behavior). MTA-STS policy (when a
+    /// `mtaSTSPolicyProvider` is configured on `DirectMXTransport`) can
+    /// upgrade `.opportunistic`'s per-domain behavior to `testing`/
+    /// `enforce` semantics on top of this default -- see
+    /// `DirectMXTransport`'s own doc comments for exactly how.
+    public var tlsPolicy: DirectMXTLSPolicy
     public var ehloHostname: String
     /// **Direct-MX-specific note (not a Phase-1 concern):** `RelayTransport`
     /// owns one pool per configured relay, so `maxTotal` is naturally a cap
@@ -90,7 +129,7 @@ public struct DirectMXConfig: Sendable {
 
     public init(
         port: Int = 25,
-        tls: TLSMode = .none,
+        tlsPolicy: DirectMXTLSPolicy = .opportunistic,
         ehloHostname: String = "localhost",
         pool: SMTPConnectionPool.Configuration = .init(),
         connectTimeout: TimeAmount = .seconds(30),
@@ -99,7 +138,7 @@ public struct DirectMXConfig: Sendable {
         allowPrivateAddresses: Bool = false
     ) {
         self.port = port
-        self.tls = tls
+        self.tlsPolicy = tlsPolicy
         self.ehloHostname = ehloHostname
         self.pool = pool
         self.connectTimeout = connectTimeout
@@ -151,19 +190,45 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     private let config: DirectMXConfig
     private let retryQueueConfiguration: DirectMXRetryQueue.Configuration
     private let retryQueue: DirectMXRetryQueue
+    /// `nil` (the default) means MTA-STS is not consulted at all for any
+    /// domain -- every destination gets exactly `config.tlsPolicy`'s
+    /// behavior (plan §9 Phase 4's opportunistic-by-default, unless
+    /// overridden to `.fixed`), with no per-domain policy lookup, no DNS
+    /// TXT query, and no HTTPS fetch ever attempted. This is a deliberate,
+    /// purely-additive default: a caller who doesn't pass this parameter
+    /// gets no new network dependency and no behavior change beyond the
+    /// opportunistic-TLS default itself (see `DirectMXTLSPolicy
+    /// .opportunistic`'s doc comment) -- MTA-STS enforcement is opt-in by
+    /// supplying a `MTASTSPolicyManager` (or a test fake conforming to
+    /// `MTASTSPolicyProviding`) here.
+    private let mtaSTSPolicyProvider: (any MTASTSPolicyProviding)?
+    private let logger: Logger
 
     /// - Parameters:
     ///   - resolver: Anything conforming to `MXResolving` -- a real
     ///     `DNSResolver` in production, a fake in tests (see
     ///     `MXResolving.swift`'s doc comment for why this seam exists).
     ///   - config: Applies uniformly to every destination -- see
-    ///     `DirectMXConfig`'s doc comments, especially `tls`'s default.
+    ///     `DirectMXConfig`'s doc comments, especially `tlsPolicy`'s
+    ///     default.
     ///   - group: The `EventLoopGroup` both the connection pool and every
     ///     dialed connection run on.
     ///   - retryQueueConfiguration: Backoff durations and the retry
     ///     ceiling/expiry policy for this transport's owned
     ///     `DirectMXRetryQueue` -- see that type's `Configuration` doc
     ///     comments.
+    ///   - mtaSTSPolicyProvider: `nil` (the default) disables MTA-STS
+    ///     entirely for this transport instance -- see this type's own
+    ///     stored-property doc comment. Pass a `MTASTSPolicyManager` to
+    ///     opt in.
+    ///   - logger: Used only to record MTA-STS `testing`-mode discrepancies
+    ///     (a policy-matched host failed mandatory TLS and delivery fell
+    ///     back to unconstrained opportunistic delivery -- RFC 8460 TLSRPT
+    ///     aggregate reporting is explicitly out of scope, plan §9 Phase 4;
+    ///     this is the "make sure testing-mode failures are distinguishable
+    ///     in whatever result/logging surface makes sense" substitute) and
+    ///     `enforce`-mode hard-fails, matching `SMTPMailer`'s own narrow,
+    ///     documented use of a logger for its DMARC-alignment lint.
     ///   - onTerminalRetryOutcome: Forwarded to the owned
     ///     `DirectMXRetryQueue` -- see that type's `init` doc comment for
     ///     why this is the only way a caller observes a *background*
@@ -173,11 +238,14 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         config: DirectMXConfig = .init(),
         group: any EventLoopGroup,
         retryQueueConfiguration: DirectMXRetryQueue.Configuration = .init(),
+        mtaSTSPolicyProvider: (any MTASTSPolicyProviding)? = nil,
+        logger: Logger = Logger(label: "PerfectSMTP.DirectMXTransport"),
         onTerminalRetryOutcome: (@Sendable (DeliveryResult) async -> Void)? = nil
     ) {
         self.init(
             resolver: resolver, config: config, group: group,
-            retryQueueConfiguration: retryQueueConfiguration, onTerminalRetryOutcome: onTerminalRetryOutcome,
+            retryQueueConfiguration: retryQueueConfiguration, mtaSTSPolicyProvider: mtaSTSPolicyProvider,
+            logger: logger, onTerminalRetryOutcome: onTerminalRetryOutcome,
             dialer: Self.makeDialer(resolver: resolver, config: config, group: group, retryQueueConfiguration: retryQueueConfiguration)
         )
     }
@@ -194,28 +262,34 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         config: DirectMXConfig = .init(),
         group: any EventLoopGroup,
         retryQueueConfiguration: DirectMXRetryQueue.Configuration = .init(),
+        mtaSTSPolicyProvider: (any MTASTSPolicyProviding)? = nil,
+        logger: Logger = Logger(label: "PerfectSMTP.DirectMXTransport"),
         onTerminalRetryOutcome: (@Sendable (DeliveryResult) async -> Void)? = nil,
         dialer: @escaping @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection
     ) {
         self.resolver = resolver
         self.config = config
         self.retryQueueConfiguration = retryQueueConfiguration
+        self.mtaSTSPolicyProvider = mtaSTSPolicyProvider
+        self.logger = logger
         let pool = SMTPConnectionPool(configuration: config.pool, group: group, dialer: dialer)
         self.pool = pool
         // Deliberately built from local `let`s (`resolver`/`config`/`pool`/
-        // `retryQueueConfiguration`), never from `self.<property>` -- this
-        // closure is constructed before every one of `self`'s stored
-        // properties is set, and capturing `self` itself here (even
-        // weakly) would need those properties already initialized. Using
-        // the local values `performDelivery` needs sidesteps the ordering
-        // question entirely: `performDelivery` is a `static` function that
-        // takes everything explicitly, so nothing here ever touches `self`.
+        // `retryQueueConfiguration`/`mtaSTSPolicyProvider`/`logger`), never
+        // from `self.<property>` -- this closure is constructed before
+        // every one of `self`'s stored properties is set, and capturing
+        // `self` itself here (even weakly) would need those properties
+        // already initialized. Using the local values `performDelivery`
+        // needs sidesteps the ordering question entirely: `performDelivery`
+        // is a `static` function that takes everything explicitly, so
+        // nothing here ever touches `self`.
         self.retryQueue = DirectMXRetryQueue(
             configuration: retryQueueConfiguration,
             redeliver: { envelope, message in
                 await Self.performDelivery(
                     envelope: envelope, message: message, resolver: resolver, pool: pool,
-                    config: config, retryQueueConfiguration: retryQueueConfiguration
+                    config: config, retryQueueConfiguration: retryQueueConfiguration,
+                    mtaSTSPolicyProvider: mtaSTSPolicyProvider, logger: logger
                 )
             },
             onTerminalOutcome: onTerminalRetryOutcome
@@ -225,7 +299,8 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
         let results = await Self.performDelivery(
             envelope: envelope, message: message, resolver: resolver, pool: pool,
-            config: config, retryQueueConfiguration: retryQueueConfiguration
+            config: config, retryQueueConfiguration: retryQueueConfiguration,
+            mtaSTSPolicyProvider: mtaSTSPolicyProvider, logger: logger
         )
         await enqueueRetries(from: results, mailFrom: envelope.mailFrom, message: message)
         return results
@@ -270,7 +345,8 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     /// never throws.
     private static func performDelivery(
         envelope: SMTPEnvelope, message: SignedMessage, resolver: any MXResolving, pool: SMTPConnectionPool,
-        config: DirectMXConfig, retryQueueConfiguration: DirectMXRetryQueue.Configuration
+        config: DirectMXConfig, retryQueueConfiguration: DirectMXRetryQueue.Configuration,
+        mtaSTSPolicyProvider: (any MTASTSPolicyProviding)?, logger: Logger
     ) async -> [DeliveryResult] {
         let grouped = Dictionary(grouping: envelope.recipients, by: domain(of:))
         guard !grouped.isEmpty else { return [] }
@@ -280,7 +356,8 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                 group.addTask {
                     await deliverToDomain(
                         domain, recipients: recipients, mailFrom: envelope.mailFrom, message: message,
-                        resolver: resolver, pool: pool, config: config, retryQueueConfiguration: retryQueueConfiguration
+                        resolver: resolver, pool: pool, config: config, retryQueueConfiguration: retryQueueConfiguration,
+                        mtaSTSPolicyProvider: mtaSTSPolicyProvider, logger: logger
                     )
                 }
             }
@@ -299,11 +376,41 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     /// this domain, not a reason to try a different host; see
     /// `attemptOnHost`, which is what actually enforces this distinction by
     /// catching and *returning* (not rethrowing) `SMTPError`-classified
-    /// rejections).
+    /// rejections). That much is unchanged from Phase 3.
+    ///
+    /// Plan §9 Phase 4 adds MTA-STS policy (when `mtaSTSPolicyProvider` is
+    /// configured) and the new opportunistic-TLS default (when
+    /// `config.tlsPolicy == .opportunistic`) on top of that same host-
+    /// fallback shape:
+    ///
+    /// - `config.tlsPolicy == .fixed(mode)`: **Phase 3 behavior, byte-for-
+    ///   byte** -- every host tried with exactly `mode`, no MTA-STS lookup
+    ///   at all (the explicit escape hatch `DirectMXTLSPolicy.fixed`'s doc
+    ///   comment describes).
+    /// - No MTA-STS policy for `domain` (no provider configured, or the
+    ///   provider returned `nil`), or a policy with `mode: none`: every
+    ///   host tried opportunistically (`.startTLS` first, `.none` fallback
+    ///   -- see `attemptOpportunisticHostsInOrder`). This is also the exact
+    ///   path `testing` mode falls back to below.
+    /// - `mode: testing`: policy-matching hosts (RFC 8461 §4.1) are tried
+    ///   first, mandatory-`.startTLS`-only, no plaintext fallback for those
+    ///   attempts. If every matching host fails for a connection/TLS-level
+    ///   reason (or there are no matching hosts at all), that's logged as a
+    ///   testing-mode discrepancy and delivery falls through to the
+    ///   ordinary opportunistic path across *all* resolved hosts --
+    ///   `testing` mode must never block delivery (RFC 8461 §5, plan §9
+    ///   Phase 4).
+    /// - `mode: enforce`: **only** policy-matching hosts are ever dialed at
+    ///   all, mandatory-`.startTLS`-only. If there are no matching hosts,
+    ///   or every matching host fails for a connection/TLS-level reason,
+    ///   the whole domain hard-fails with a distinct, `.permanentlyFailed`-
+    ///   classified outcome (`mtaSTSEnforceViolationOutcome`) -- never a
+    ///   silent degrade to plaintext or to a non-matching host.
     private static func deliverToDomain(
         _ domain: String, recipients: [String], mailFrom: ReversePath, message: SignedMessage,
         resolver: any MXResolving, pool: SMTPConnectionPool, config: DirectMXConfig,
-        retryQueueConfiguration: DirectMXRetryQueue.Configuration
+        retryQueueConfiguration: DirectMXRetryQueue.Configuration,
+        mtaSTSPolicyProvider: (any MTASTSPolicyProviding)?, logger: Logger
     ) async -> [DeliveryResult] {
         let hosts: [String]
         do {
@@ -316,11 +423,91 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         }
 
         var lastError: any Error = DirectMXError.noUsableMXHost(domain: domain)
+
+        // `.fixed(mode)`: Phase 3's exact original loop, untouched -- no
+        // MTA-STS lookup at all, no opportunistic fallback.
+        if case .fixed(let mode) = config.tlsPolicy {
+            if let results = await attemptHostsInOrder(
+                hosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: mode) },
+                recipients: recipients, mailFrom: mailFrom, message: message,
+                pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
+            ) { return results }
+            return recipients.map { DeliveryResult(recipient: $0, outcome: .failed(lastError)) }
+        }
+
+        if let mtaSTSPolicyProvider, let policy = await mtaSTSPolicyProvider.policy(for: domain), policy.mode != .none {
+            let matchedHosts = hosts.filter { host in policy.mxPatterns.contains { MXPatternMatcher.matches(pattern: $0, host: host) } }
+
+            switch policy.mode {
+            case .enforce:
+                guard !matchedHosts.isEmpty else {
+                    logger.warning(
+                        "MTA-STS enforce: no resolved MX host matches the policy's mx: patterns; hard-failing delivery",
+                        metadata: ["domain": "\(domain)", "resolvedHosts": "\(hosts)", "mxPatterns": "\(policy.mxPatterns)"]
+                    )
+                    let outcome = mtaSTSEnforceViolationOutcome(domain: domain, reason: "no resolved MX host matches the policy's mx: patterns")
+                    return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
+                }
+                if let results = await attemptHostsInOrder(
+                    matchedHosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: .startTLS) },
+                    recipients: recipients, mailFrom: mailFrom, message: message,
+                    pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
+                ) { return results }
+                logger.warning(
+                    "MTA-STS enforce: every policy-matched MX host failed a mandatory-TLS connection attempt; hard-failing delivery",
+                    metadata: ["domain": "\(domain)", "matchedHosts": "\(matchedHosts)", "lastError": "\(lastError)"]
+                )
+                let outcome = mtaSTSEnforceViolationOutcome(domain: domain, reason: "every policy-matched MX host failed mandatory STARTTLS (last error: \(lastError))")
+                return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
+
+            case .testing:
+                if let results = await attemptHostsInOrder(
+                    matchedHosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: .startTLS) },
+                    recipients: recipients, mailFrom: mailFrom, message: message,
+                    pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
+                ) { return results }
+                logger.notice(
+                    "MTA-STS testing: policy-matched mandatory-TLS delivery did not succeed (or no MX host matched); falling back to unconstrained opportunistic delivery -- testing mode never blocks delivery",
+                    metadata: [
+                        "domain": "\(domain)", "matchedHosts": "\(matchedHosts)",
+                        "reason": matchedHosts.isEmpty ? "no MX host matched the policy's mx: patterns" : "\(lastError)",
+                    ]
+                )
+                // Falls through to the unconstrained opportunistic path
+                // below -- testing mode must never block delivery.
+
+            case .none:
+                break // unreachable: guarded by `policy.mode != .none` above; kept exhaustive.
+            }
+        }
+
+        if let results = await attemptOpportunisticHostsInOrder(
+            hosts, port: config.port, recipients: recipients, mailFrom: mailFrom, message: message,
+            pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
+        ) { return results }
+        return recipients.map { DeliveryResult(recipient: $0, outcome: .failed(lastError)) }
+    }
+
+    /// Tries `hosts` in order, each with exactly `keyForHost(host)` -- no
+    /// opportunistic fallback within a single host. Returns the first
+    /// host's result once a connection is actually established and a mail
+    /// transaction run against it (regardless of the SMTP-level outcome
+    /// that transaction itself produced -- a real rejection from a
+    /// connected host is a real outcome, not a reason to keep trying other
+    /// hosts, matching `deliverToDomain`'s original Phase 3 contract), or
+    /// `nil` if every host's own connection attempt failed (`lastError` is
+    /// updated with the most recent failure either way, mirroring the
+    /// original loop's `lastError` bookkeeping).
+    private static func attemptHostsInOrder(
+        _ hosts: [String], keyForHost: (String) -> SMTPConnectionPool.Key,
+        recipients: [String], mailFrom: ReversePath, message: SignedMessage,
+        pool: SMTPConnectionPool, retryQueueConfiguration: DirectMXRetryQueue.Configuration,
+        lastError: inout any Error
+    ) async -> [DeliveryResult]? {
         for host in hosts {
-            let key = SMTPConnectionPool.Key(host: host, port: config.port, tls: config.tls)
             do {
                 return try await attemptOnHost(
-                    key: key, recipients: recipients, mailFrom: mailFrom, message: message,
+                    key: keyForHost(host), recipients: recipients, mailFrom: mailFrom, message: message,
                     pool: pool, retryQueueConfiguration: retryQueueConfiguration
                 )
             } catch {
@@ -328,7 +515,82 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                 continue
             }
         }
-        return recipients.map { DeliveryResult(recipient: $0, outcome: .failed(lastError)) }
+        return nil
+    }
+
+    /// Plan §9 Phase 4 point 4: per host, try `.startTLS` first
+    /// (mandatory-verified); on a genuine, non-injection connection/TLS
+    /// failure, retry the **same host** with `.none` before moving on to
+    /// the next resolved host. **Security-critical distinction (do not
+    /// weaken):** a detected `SMTPError.starttlsInjection` on the
+    /// `.startTLS` attempt never triggers the `.none` retry for that host
+    /// -- it is exactly the downgrade-attack outcome the STARTTLS
+    /// buffer-discipline design (plan §4.3) exists to prevent. An
+    /// injection detection only ever advances to the *next resolved host*
+    /// (ordinary host-level fallback, ultimately still subject to the same
+    /// SSRF-class address filtering and circuit breaker as every other
+    /// host attempt), never retries the same host unauthenticated.
+    private static func attemptOpportunisticHostsInOrder(
+        _ hosts: [String], port: Int, recipients: [String], mailFrom: ReversePath, message: SignedMessage,
+        pool: SMTPConnectionPool, retryQueueConfiguration: DirectMXRetryQueue.Configuration,
+        lastError: inout any Error
+    ) async -> [DeliveryResult]? {
+        for host in hosts {
+            let startTLSKey = SMTPConnectionPool.Key(host: host, port: port, tls: .startTLS)
+            do {
+                return try await attemptOnHost(
+                    key: startTLSKey, recipients: recipients, mailFrom: mailFrom, message: message,
+                    pool: pool, retryQueueConfiguration: retryQueueConfiguration
+                )
+            } catch {
+                lastError = error
+                if isSTARTTLSInjection(error) {
+                    // Never fall back to plaintext after a detected
+                    // injection attack against this host -- move on to the
+                    // next resolved MX host instead, exactly like any other
+                    // host-level connection failure.
+                    continue
+                }
+                let plaintextKey = SMTPConnectionPool.Key(host: host, port: port, tls: .none)
+                do {
+                    return try await attemptOnHost(
+                        key: plaintextKey, recipients: recipients, mailFrom: mailFrom, message: message,
+                        pool: pool, retryQueueConfiguration: retryQueueConfiguration
+                    )
+                } catch {
+                    lastError = error
+                    continue
+                }
+            }
+        }
+        return nil
+    }
+
+    /// `true` only for a genuine, detected STARTTLS-injection attempt (RFC
+    /// 5321 STARTTLS buffer-discipline violation, plan §4.3) -- every other
+    /// thrown error (absence of STARTTLS support, a legitimate certificate/
+    /// handshake failure, a plain connection error, a circuit-open
+    /// rejection) returns `false` and is treated as an ordinary
+    /// opportunistic-fallback trigger.
+    private static func isSTARTTLSInjection(_ error: any Error) -> Bool {
+        guard case SMTPError.starttlsInjection = error else { return false }
+        return true
+    }
+
+    /// Plan §9 Phase 4's "enforce-mode hard-fail" requirement: a distinct,
+    /// clearly-classified `.permanentlyFailed` outcome -- never
+    /// `.queuedForRetry` (an MTA-STS enforce violation is a policy
+    /// decision, not a transient server condition retrying would resolve)
+    /// and never silently downgraded to plaintext or a non-matching host.
+    /// RFC 8461 itself defines no SMTP-level reply code for this (the
+    /// violation is detected before/around the SMTP conversation, at the
+    /// TLS-policy layer) -- `550 5.7.1` is this library's own conventional
+    /// choice (a generic, widely-recognized "delivery not authorized,
+    /// security policy" enhanced status), matching the precedent this
+    /// codebase already set for its own non-RFC-mandated synthesized
+    /// replies (e.g. `classify(resolveError:)`'s `556 5.1.10` for null-MX).
+    private static func mtaSTSEnforceViolationOutcome(domain: String, reason: String) -> DeliveryResult.Outcome {
+        .permanentlyFailed(SMTPReply(code: 550, lines: ["5.7.1 MTA-STS enforce policy violation for domain \(domain): \(reason)"]))
     }
 
     /// Checks out (dialing if needed) a pooled connection to `key` and runs
@@ -587,6 +849,25 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                     )
                     try await connection.negotiateCapabilities()
                     return connection
+                } catch let error as SMTPError {
+                    // Plan §9 Phase 4 security requirement: a detected
+                    // STARTTLS-injection attack against *this* address must
+                    // never be masked by trying another address for the
+                    // same host and reporting only that later, possibly
+                    // benign, error as `lastError` -- surfacing it
+                    // immediately (rather than letting the per-address loop
+                    // continue) is what lets `deliverToDomain`'s
+                    // opportunistic-TLS fallback
+                    // (`attemptOpportunisticHostsInOrder`) correctly refuse
+                    // to retry this host with `TLSMode.none` after an
+                    // injection detection -- if a later, unrelated
+                    // address's ordinary connection failure were allowed to
+                    // overwrite `lastError` here, that caller would never
+                    // see the injection and could wrongly fall back to
+                    // plaintext.
+                    if case .starttlsInjection = error { throw error }
+                    lastError = error
+                    continue
                 } catch {
                     lastError = error
                     continue

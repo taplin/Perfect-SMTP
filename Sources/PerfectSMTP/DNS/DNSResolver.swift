@@ -218,6 +218,36 @@ public struct DNSResolver: Sendable {
         return combined
     }
 
+    /// Resolves TXT records for `name`, returning one `String` per resource
+    /// record found -- each record's `<character-string>`s concatenated
+    /// (RFC 8461's `v=STSv1; id=...` value is conventionally emitted as a
+    /// single `<character-string>` in practice, but concatenating rather
+    /// than taking only the first is the safer, more conservative reading
+    /// for the rare record split across more than one). Added for plan §9
+    /// Phase 4 (MTA-STS discovery, RFC 8461 §3.1) -- deliberately narrow,
+    /// matching this resolver's existing scope discipline: no attempt at a
+    /// general-purpose TXT API (SPF/DKIM-style multi-value parsing, record
+    /// selection heuristics, etc.), just "give me every TXT string this
+    /// name publishes" and let the caller (`MTASTSPolicyManager`) decide
+    /// what to do with it.
+    ///
+    /// - Throws: `.noRecordsFound` if there are no TXT records at all
+    ///   (NODATA or NXDOMAIN) -- the normal, expected outcome for the
+    ///   overwhelming majority of domains, which don't publish an
+    ///   `_mta-sts.<domain>` TXT record at all. Every other error case is
+    ///   shared with `resolveMX`/`resolveAddresses` (see those doc
+    ///   comments) since the underlying query mechanics are identical.
+    public func resolveTXT(name: String) async throws -> [String] {
+        let message = try await query(name: name, type: .txt)
+        try Self.validateResponseCode(message)
+        let strings: [String] = message.answers.compactMap { record in
+            guard case .txt(let parts) = record.rdata else { return nil }
+            return parts.joined()
+        }
+        guard !strings.isEmpty else { throw ResolveError.noRecordsFound }
+        return strings
+    }
+
     // MARK: - MX processing (pure, unit-tested directly against hand-built records)
 
     /// Converts a decoded answer section's MX records into the sorted,
@@ -301,7 +331,7 @@ public struct DNSResolver: Sendable {
                 if type == .aaaa { addresses.append(address) }
             case .cname(let target):
                 cnameTarget = target
-            case .mx, .other:
+            case .mx, .txt, .other:
                 break
             }
         }

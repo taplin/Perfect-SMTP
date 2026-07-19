@@ -167,7 +167,16 @@ struct DirectMXTransportTests {
         }
 
         let threshold = 2
-        let config = DirectMXConfig(pool: .init(maxPerHost: 4, maxTotal: 100, circuitBreakerThreshold: threshold, circuitBreakerResetTimeout: .seconds(30)))
+        // `.fixed(.none)` -- this test asserts an *exact* dial-attempt
+        // count against the flaky host, which the opportunistic default
+        // (two candidate keys, `.startTLS` then `.none`, each with its own
+        // independently-tracked circuit-breaker state) would double,
+        // decoupling the assertion from what this test actually cares
+        // about (breaker-driven host fallback, not TLS-mode selection).
+        let config = DirectMXConfig(
+            tlsPolicy: .fixed(.none),
+            pool: .init(maxPerHost: 4, maxTotal: 100, circuitBreakerThreshold: threshold, circuitBreakerResetTimeout: .seconds(30))
+        )
         let transport = DirectMXTransport(resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(), dialer: dialer)
 
         // Every call still succeeds end-to-end (via the fallback host),
@@ -312,7 +321,13 @@ struct DirectMXTransportTests {
             return connection
         }
 
-        let config = DirectMXConfig(pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: .seconds(30)))
+        // `.fixed(.none)` -- see the identical note on
+        // `repeatedHostFailuresTripTheBreakerAndFallbackRoutesAroundIt`:
+        // this test's `dialAttempts` guard hard-fails on any dial beyond
+        // the first, which the opportunistic default's second (`.none`)
+        // candidate key would trigger after the first (`.startTLS`) key's
+        // breaker trips, for reasons unrelated to what this test covers.
+        let config = DirectMXConfig(tlsPolicy: .fixed(.none), pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: .seconds(30)))
         let transport = DirectMXTransport(resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(), dialer: dialer)
 
         let r1 = try await transport.send(try envelope(recipients: ["a@goesambiguous.example"]), message())
@@ -384,7 +399,12 @@ struct DirectMXTransportTests {
             return connection
         }
 
-        let config = DirectMXConfig(pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: .seconds(30)))
+        // `.fixed(.none)` -- same rationale as the other breaker-count
+        // tests above: this test's `dialAttempts` guard is exact-count
+        // sensitive, which the opportunistic default's second candidate
+        // key would perturb for reasons unrelated to what this test
+        // covers (421 feeding the breaker and not idling the connection).
+        let config = DirectMXConfig(tlsPolicy: .fixed(.none), pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: .seconds(30)))
         let transport = DirectMXTransport(resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(), dialer: dialer)
 
         let r1 = try await transport.send(try envelope(recipients: ["a@goes421.example"]), message())

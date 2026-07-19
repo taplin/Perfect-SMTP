@@ -42,7 +42,7 @@ struct DirectMXRealSocketTests {
             // internal-relay-testing use case (see `DirectMXConfig
             // .allowPrivateAddresses`'s doc comment) -- without it, this
             // test's own address would be filtered before ever dialing.
-            config: DirectMXConfig(port: server.port, tls: .none, allowPrivateAddresses: true),
+            config: DirectMXConfig(port: server.port, tlsPolicy: .fixed(.none), allowPrivateAddresses: true),
             group: group
         )
 
@@ -82,7 +82,7 @@ struct DirectMXRealSocketTests {
         // reachable at this address/port.
         let transport = DirectMXTransport(
             resolver: resolver,
-            config: DirectMXConfig(port: server.port, tls: .none),
+            config: DirectMXConfig(port: server.port, tlsPolicy: .fixed(.none)),
             group: group
         )
 
