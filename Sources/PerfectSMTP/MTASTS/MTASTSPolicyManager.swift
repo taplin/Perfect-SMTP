@@ -43,15 +43,37 @@ public protocol MTASTSPolicyProviding: Sendable {
 /// which this type catches and folds into one of these instead of letting
 /// callers reach into transport-specific failure detail they don't need).
 enum MTASTSDiscoveryError: Error, Sendable, Equatable {
-    /// No `_mta-sts.<domain>` TXT record advertising `v=STSv1` was found
-    /// (RFC 8461 §3.1) -- the ordinary, expected outcome for the vast
-    /// majority of domains, which simply don't publish MTA-STS at all.
+    /// FIX A (protocol review): covers every way RFC 8461 §3.1's "exactly
+    /// one, syntactically valid" gate can fail -- no TXT record at all,
+    /// more than one TXT record (an ambiguous discovery result the RFC
+    /// explicitly says MUST be treated as "no policy", not "pick one"),
+    /// or a single record that isn't a syntactically valid `v=STSv1;
+    /// id=...` string. This is by far the ordinary, expected outcome for
+    /// the vast majority of domains, which simply don't publish MTA-STS at
+    /// all -- not just the zero-records case.
     case noSTSv1DiscoveryRecord
     /// The HTTPS fetch itself failed: a network/TLS error, or a non-200
     /// status code (RFC 8461 §3.3).
     case fetchFailed
     /// The response's `Content-Type` wasn't `text/plain` (RFC 8461 §3.2).
     case invalidContentType
+    /// FIX C (protocol review): the response body exceeded
+    /// `MTASTSPolicyManager.maximumPolicyResponseSizeBytes` (RFC 8461 §3.3
+    /// SHOULD, 64KB) -- folded into "fetch failed" from every caller's
+    /// perspective (falls back to a valid cached policy if one exists, per
+    /// `policy(for:)`'s existing fallback logic) rather than given its own
+    /// externally-visible handling, but kept as a distinct case here for
+    /// diagnosability.
+    case responseTooLarge
+    /// FIX D (protocol review, option (a)): every address
+    /// `addressResolver` resolved for the MTA-STS HTTPS fetch hostname
+    /// (`mta-sts.<domain>`) was filtered out as private/loopback/link-
+    /// local/unique-local/CGNAT (see `DNSAddress.isRoutable`) -- mirrors
+    /// `DirectMXError.allResolvedAddressesFilteredAsPrivate`'s identical
+    /// treatment of the direct-MX dial path. Never thrown when
+    /// `addressResolver` is `nil` (SSRF filtering not configured) or when
+    /// `Configuration.allowPrivateAddresses` is `true`.
+    case addressFilteredAsPrivate
     /// The response body didn't parse as a valid policy file
     /// (`MTASTSPolicyParser.parse(_:)` returned `nil`).
     case malformedPolicy
@@ -65,6 +87,38 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     private struct CachedPolicy {
         let policy: MTASTSPolicy
         let expiresAt: Date
+        /// FIX B (protocol review): the discovery TXT record's `id=` token
+        /// (RFC 8461 §3.1) captured at the moment this entry was fetched --
+        /// compared against a fresh TXT lookup's `id` on each due
+        /// `idRecheckInterval` cadence (see `policy(for:)`) so a domain
+        /// that publishes a policy update faster than this entry's own
+        /// `max_age` still gets picked up.
+        let discoveryID: String
+        /// FIX B: when this entry's `id` was last verified against a live
+        /// TXT lookup (as opposed to `expiresAt`, which tracks the
+        /// unrelated `max_age`-based full-policy expiry). Starts equal to
+        /// the fetch time; bumped forward on every id-recheck, whether the
+        /// id matched or the recheck was inconclusive (see `policy(for:)`).
+        var lastIDCheckedAt: Date
+    }
+
+    /// FIX B (protocol review): one successfully parsed discovery TXT
+    /// record (RFC 8461 §3.1's `v=STSv1; id=<token>; ...`), reduced to just
+    /// the `id` value this manager actually needs -- returned by
+    /// `discoverValidRecord(domain:)`, the single place both a full fetch
+    /// and a cheap id-only recheck go through, so FIX A's "exactly one,
+    /// syntactically valid" gate is enforced identically either way.
+    private struct DiscoveryRecord: Sendable, Equatable {
+        let id: String
+    }
+
+    /// One fully fetched-and-parsed policy, plus the discovery record's
+    /// `id` it was fetched under -- what `fetchAndParsePolicy(domain:)`
+    /// returns, so `policy(for:)` can populate `CachedPolicy.discoveryID`
+    /// without a second TXT lookup.
+    private struct FetchedPolicy {
+        let policy: MTASTSPolicy
+        let discoveryID: String
     }
 
     /// FIX #2 / FIX #4 (milestone architecture + security review, both
@@ -124,19 +178,86 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         /// the one whose `expiresAt` has drifted furthest into the past
         /// relative to its peers.
         public var maxCacheEntries: Int
+        /// FIX B (protocol review): how often a still-`max_age`-valid
+        /// cached entry's discovery `id` is re-verified against a fresh
+        /// `_mta-sts.<domain>` TXT lookup, per RFC 8461 §3.1 ("senders
+        /// need only check the TXT record's version 'id' against the
+        /// cached value") and §3.3's suggested cadence ("once per day").
+        /// Deliberately **not** the same knob as `staleCacheCeiling` or a
+        /// policy's own `max_age` -- this is a much cheaper, much more
+        /// frequent-relative-to-nothing check (one TXT lookup, no HTTPS
+        /// fetch) than a full refresh, and doing it on every single
+        /// `policy(for:)` call would defeat the entire point of caching
+        /// (one DNS round-trip per send instead of zero). Default 24
+        /// hours, directly matching RFC 8461 §3.3's own suggested cadence
+        /// rather than an unrelated number borrowed from elsewhere in this
+        /// codebase.
+        ///
+        /// A cached entry whose `lastIDCheckedAt` is still within this
+        /// interval is returned from the fast path with **zero** network
+        /// calls, exactly as before this fix -- only once the interval has
+        /// elapsed does `policy(for:)` spend one TXT lookup confirming the
+        /// `id` hasn't changed before continuing to trust the cached
+        /// policy body.
+        public var idRecheckInterval: Duration
+        /// FIX D (protocol review, option (a)): mirrors `DirectMXConfig
+        /// .allowPrivateAddresses` for the MTA-STS HTTPS fetch target --
+        /// `false` (filtering on) by default, since the same "attacker
+        /// controls the recipient domain" threat model
+        /// `DirectMXConfig`'s own doc comment describes applies equally to
+        /// `mta-sts.<domain>`. Only takes effect when `addressResolver` is
+        /// non-`nil` (see `MTASTSPolicyManager.init`'s doc comment) -- with
+        /// no address resolver configured, there is nothing for this flag
+        /// to modulate.
+        public var allowPrivateAddresses: Bool
 
         public init(
             staleCacheCeiling: Duration = .seconds(5 * 24 * 3600),
-            maxCacheEntries: Int = 10_000
+            maxCacheEntries: Int = 10_000,
+            idRecheckInterval: Duration = .seconds(24 * 3600),
+            allowPrivateAddresses: Bool = false
         ) {
             self.staleCacheCeiling = staleCacheCeiling
             self.maxCacheEntries = maxCacheEntries
+            self.idRecheckInterval = idRecheckInterval
+            self.allowPrivateAddresses = allowPrivateAddresses
         }
     }
+
+    /// RFC 8461 §3.3 SHOULD: "a maximum size for the policy file" -- FIX C
+    /// (protocol review). 64KB, deliberately matching `SMTPBootstrap
+    /// .maximumReplyBufferSize`'s identical discipline elsewhere in this
+    /// codebase for the same reason: a real MTA-STS policy file (a handful
+    /// of `key: value` lines, at most a few dozen `mx:` patterns) is never
+    /// remotely close to this size, so the cap is pure DoS hardening with
+    /// no legitimate-policy cost. Enforced post-fetch (see
+    /// `fetchAndParsePolicy(domain:)`) -- `URLSession.data(for:)` gives no
+    /// clean hook to abort mid-stream at a byte cap, so this doesn't stop
+    /// the oversized bytes from being received, but it does guarantee an
+    /// oversized response is never parsed, cached, or acted upon, which is
+    /// the protection that actually matters here.
+    static let maximumPolicyResponseSizeBytes = 64 * 1024
 
     private var cache: [String: CachedPolicy] = [:]
     private let dnsResolver: any TXTResolving
     private let httpFetcher: any MTASTSHTTPFetching
+    /// FIX D (protocol review, option (a)): `nil` (the default) means the
+    /// MTA-STS HTTPS fetch target is never pre-checked against
+    /// `DNSAddress.isRoutable` before this manager attempts the fetch --
+    /// the same "purely additive opt-in" shape `DirectMXTransport`'s own
+    /// `mtaSTSPolicyProvider` uses (see that property's doc comment): a
+    /// caller who doesn't pass this gets no new network dependency (no
+    /// extra DNS round-trip before every cache-miss fetch) and no behavior
+    /// change from this fix. **A caller integrating this library with
+    /// untrusted recipient input should pass a real `MTASTSAddressResolving`
+    /// (a `DNSResolver`, which already conforms) here** -- exactly the same
+    /// "attacker controls the recipient domain" threat model
+    /// `DirectMXConfig`'s doc comment describes for the direct-MX dial path
+    /// applies identically to the `https://mta-sts.<domain>/...` fetch this
+    /// manager performs, and leaving this `nil` leaves that fetch
+    /// unprotected by the address filtering this codebase otherwise treats
+    /// as a first-class concern.
+    private let addressResolver: (any MTASTSAddressResolving)?
     private let configuration: Configuration
     /// Injectable purely for deterministic cache-expiry tests (mirroring
     /// this codebase's other "inject the clock" test seams, e.g.
@@ -144,12 +265,22 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// always uses `Date.init` (the real wall clock).
     private let now: @Sendable () -> Date
 
+    /// - Parameter addressResolver: FIX D (protocol review, option (a)) --
+    ///   see the stored property's own doc comment. `nil` by default
+    ///   (purely additive opt-in, matching `DirectMXTransport
+    ///   .mtaSTSPolicyProvider`'s identical shape) -- pass a `DNSResolver`
+    ///   (or any other `MTASTSAddressResolving` conformance) to enable
+    ///   SSRF-class filtering of the MTA-STS HTTPS fetch target.
     public init(
         dnsResolver: any TXTResolving,
         httpFetcher: any MTASTSHTTPFetching = URLSessionMTASTSFetcher(),
+        addressResolver: (any MTASTSAddressResolving)? = nil,
         configuration: Configuration = .init()
     ) {
-        self.init(dnsResolver: dnsResolver, httpFetcher: httpFetcher, configuration: configuration, now: Date.init)
+        self.init(
+            dnsResolver: dnsResolver, httpFetcher: httpFetcher, addressResolver: addressResolver,
+            configuration: configuration, now: Date.init
+        )
     }
 
     /// Test/internal-only initializer: overrides the clock so cache-expiry
@@ -157,10 +288,12 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// realistic `max_age`.
     init(
         dnsResolver: any TXTResolving, httpFetcher: any MTASTSHTTPFetching,
+        addressResolver: (any MTASTSAddressResolving)? = nil,
         configuration: Configuration = .init(), now: @escaping @Sendable () -> Date
     ) {
         self.dnsResolver = dnsResolver
         self.httpFetcher = httpFetcher
+        self.addressResolver = addressResolver
         self.configuration = configuration
         self.now = now
     }
@@ -174,16 +307,65 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         // Fast path: a still-valid cached policy is used directly, with no
         // discovery/fetch at all (plan §9 Phase 4's "cache... so you're not
         // fetching on every single send" requirement) -- this is the only
-        // branch that guarantees zero calls to `dnsResolver`/`httpFetcher`.
+        // branch that guarantees zero calls to `dnsResolver`/`httpFetcher`,
+        // *unless* FIX B's id-recheck cadence is due (see below), in which
+        // case it costs at most one TXT lookup, never an HTTPS fetch.
         if let cached = cache[domain], cached.expiresAt > currentTime {
-            return cached.policy
+            let recheckDue = currentTime.timeIntervalSince(cached.lastIDCheckedAt) >= configuration.idRecheckInterval.timeIntervalValue
+            if !recheckDue {
+                return cached.policy
+            }
+            // FIX B (protocol review): RFC 8461 §3.1 -- "senders need only
+            // check the TXT record's version 'id' against the cached
+            // value" -- and §3.3's suggested "once per day" cadence
+            // (`configuration.idRecheckInterval`). A still-`max_age`-valid
+            // cached policy is otherwise never re-verified at all until it
+            // naturally expires, so a domain that republishes a policy
+            // update (a fresh `id`) faster than its old policy's `max_age`
+            // would not have that update picked up until the stale entry
+            // expired on its own -- this closes that gap without checking
+            // on every single call (which would defeat the point of
+            // caching).
+            switch await currentDiscoveryID(domain: domain) {
+            case .some(let currentID) where currentID == cached.discoveryID:
+                // Unchanged -- still the same policy, just note the fresh
+                // verification so the next recheck isn't due for another
+                // full `idRecheckInterval`.
+                var refreshed = cached
+                refreshed.lastIDCheckedAt = currentTime
+                cache[domain] = refreshed
+                return cached.policy
+            case .some:
+                // The id changed -- RFC 8461 §3.1's signal that an updated
+                // policy is available. Treat exactly like a cache miss:
+                // fall through to the full discovery/fetch/parse below
+                // rather than continuing to serve the now-known-stale
+                // cached policy body.
+                break
+            case .none:
+                // The recheck itself was inconclusive (TXT lookup failed,
+                // or the record is no longer exactly-one/syntactically
+                // valid per FIX A's gate) -- a transient DNS blip
+                // shouldn't discard a policy that's still genuinely
+                // `max_age`-valid, so this falls back to the cached policy
+                // exactly like a full-fetch failure would (see the `catch`
+                // branch below), just without spending an HTTPS round-trip
+                // to discover that nothing changed. `lastIDCheckedAt` is
+                // still bumped so a persistently-failing recheck doesn't
+                // retry every single call -- it retries once per
+                // `idRecheckInterval`, same cadence as the success path.
+                var refreshed = cached
+                refreshed.lastIDCheckedAt = currentTime
+                cache[domain] = refreshed
+                return cached.policy
+            }
         }
 
         do {
-            let policy = try await fetchAndParsePolicy(domain: domain)
-            let expiresAt = currentTime.addingTimeInterval(policy.maxAge.timeIntervalValue)
-            insertIntoCache(domain: domain, policy: policy, expiresAt: expiresAt)
-            return policy
+            let fetched = try await fetchAndParsePolicy(domain: domain)
+            let expiresAt = currentTime.addingTimeInterval(fetched.policy.maxAge.timeIntervalValue)
+            insertIntoCache(domain: domain, fetched: fetched, expiresAt: expiresAt, fetchedAt: currentTime)
+            return fetched.policy
         } catch {
             // FIX #2 (milestone architecture review, BLOCKING -- corrected
             // citation): RFC 8461 §3.3 (fetched and verified directly
@@ -241,34 +423,121 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// already-cached domain never counts against the cap (it's not a new
     /// entry), so this only ever evicts when a genuinely new domain would
     /// push `cache.count` past the configured limit.
-    private func insertIntoCache(domain: String, policy: MTASTSPolicy, expiresAt: Date) {
+    private func insertIntoCache(domain: String, fetched: FetchedPolicy, expiresAt: Date, fetchedAt: Date) {
         if cache[domain] == nil, cache.count >= configuration.maxCacheEntries {
             if let oldestDomain = cache.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
                 cache.removeValue(forKey: oldestDomain)
             }
         }
-        cache[domain] = CachedPolicy(policy: policy, expiresAt: expiresAt)
+        cache[domain] = CachedPolicy(
+            policy: fetched.policy, expiresAt: expiresAt,
+            discoveryID: fetched.discoveryID, lastIDCheckedAt: fetchedAt
+        )
     }
 
-    /// Discovery (RFC 8461 §3.1) + fetch (§3.2) + parse, as one throwing
-    /// operation -- any failure at any stage is folded into an
-    /// `MTASTSDiscoveryError`, caught by `policy(for:)`'s caller above.
-    private func fetchAndParsePolicy(domain: String) async throws -> MTASTSPolicy {
+    /// FIX A / FIX B (protocol review): RFC 8461 §3.1's discovery gate,
+    /// factored out of `fetchAndParsePolicy(domain:)` so both a full fetch
+    /// and a cheap `policy(for:)` id-only recheck enforce the exact same
+    /// "exactly one, syntactically valid" rule and parse the `id` the same
+    /// way -- there is exactly one place in this actor that decides
+    /// whether a TXT lookup result counts as "a valid MTA-STS discovery
+    /// record" at all.
+    ///
+    /// - Throws: `.noSTSv1DiscoveryRecord` if the TXT lookup itself
+    ///   failed, returned anything other than exactly one record (RFC
+    ///   8461 §3.1: "If the number of resulting records is not one ...
+    ///   senders MUST assume the recipient domain does not have an
+    ///   available MTA-STS Policy" -- fetched and verified directly
+    ///   against the published RFC text), or that one record isn't a
+    ///   syntactically valid `v=STSv1; ...; id=<token>; ...` string (the
+    ///   same guard's "or if the resulting record is syntactically
+    ///   invalid" clause -- a record with no `id` field at all is treated
+    ///   as syntactically invalid here, since FIX B has no cached value to
+    ///   compare against without one).
+    private func discoverValidRecord(domain: String) async throws -> DiscoveryRecord {
         let discoveryRecords: [String]
         do {
             discoveryRecords = try await dnsResolver.resolveTXT(name: "_mta-sts.\(domain)")
         } catch {
             throw MTASTSDiscoveryError.noSTSv1DiscoveryRecord
         }
-        guard discoveryRecords.contains(where: { $0.hasPrefix("v=STSv1") }) else {
+        guard discoveryRecords.count == 1, let record = discoveryRecords.first,
+              let parsed = Self.parseDiscoveryRecord(record)
+        else {
             throw MTASTSDiscoveryError.noSTSv1DiscoveryRecord
         }
+        return parsed
+    }
+
+    /// Parses one `_mta-sts.<domain>` TXT record's `v=STSv1; id=<token>;
+    /// ...` syntax (RFC 8461 §3.1) into a `DiscoveryRecord`, or `nil` if it
+    /// isn't one -- the version tag isn't exactly `v=STSv1`, or there's no
+    /// non-empty `id` field. Deliberately tolerant of the exact separator
+    /// spacing the RFC's own examples vary on (`v=STSv1; id=...` vs.
+    /// `v=STSv1;id=...`) by trimming whitespace around each `;`-delimited
+    /// field, mirroring `MTASTSPolicyParser.parse(_:)`'s own
+    /// defensive-but-not-loose tolerance for a real, untrusted DNS
+    /// response.
+    private static func parseDiscoveryRecord(_ record: String) -> DiscoveryRecord? {
+        let fields = record.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let versionField = fields.first, versionField == "v=STSv1" else { return nil }
+        for field in fields.dropFirst() {
+            guard let equalsIndex = field.firstIndex(of: "=") else { continue }
+            let key = field[field.startIndex..<equalsIndex].trimmingCharacters(in: .whitespaces)
+            let value = field[field.index(after: equalsIndex)...].trimmingCharacters(in: .whitespaces)
+            guard key == "id", !value.isEmpty else { continue }
+            return DiscoveryRecord(id: value)
+        }
+        return nil
+    }
+
+    /// FIX B: the cheap half of the id-recheck -- just the discovery gate,
+    /// with every failure mode (lookup error, ambiguous/invalid record)
+    /// folded into `nil` rather than a thrown error, since `policy(for:)`'s
+    /// recheck path treats "couldn't confirm" the same regardless of which
+    /// specific thing went wrong (see that call site's own comment).
+    private func currentDiscoveryID(domain: String) async -> String? {
+        (try? await discoverValidRecord(domain: domain))?.id
+    }
+
+    /// Discovery (RFC 8461 §3.1) + FIX D's SSRF-class address pre-check +
+    /// fetch (§3.2) + FIX C's response-size cap + parse, as one throwing
+    /// operation -- any failure at any stage is folded into an
+    /// `MTASTSDiscoveryError`, caught by `policy(for:)`'s caller above.
+    private func fetchAndParsePolicy(domain: String) async throws -> FetchedPolicy {
+        let record = try await discoverValidRecord(domain: domain)
 
         // RFC 8461 §3.2: always `https://mta-sts.<domain>/.well-known/mta-sts.txt`,
         // never derived from a resolved MX hostname or affected by any
         // caller-configured port.
         guard let url = URL(string: "https://mta-sts.\(domain)/.well-known/mta-sts.txt") else {
             throw MTASTSDiscoveryError.fetchFailed
+        }
+
+        // FIX D (protocol review, option (a)): pre-check the fetch target's
+        // resolved addresses against `DNSAddress.isRoutable` before ever
+        // attempting the HTTPS fetch -- mirrors `DirectMXTransport
+        // .makeDialer`'s identical treatment of the direct-MX dial path.
+        // A no-op (as before this fix) when `addressResolver` is `nil` --
+        // see that stored property's doc comment for why this is an
+        // opt-in dependency rather than a forced one. This is a refusal-
+        // to-attempt gate, not a pinned-address dial: it doesn't force
+        // `URLSession` to connect to a specific pre-resolved address (not
+        // practical to do cleanly with `URLSession`'s own connection
+        // establishment) -- it just declines to even try the fetch when
+        // every address this hostname resolves to is private/reserved,
+        // which closes most of the practical SSRF risk without fighting
+        // `URLSession` internals.
+        if let addressResolver, !configuration.allowPrivateAddresses {
+            let resolvedAddresses: [DNSAddress]
+            do {
+                resolvedAddresses = try await addressResolver.resolveAddresses(hostname: url.host ?? "mta-sts.\(domain)")
+            } catch {
+                throw MTASTSDiscoveryError.fetchFailed
+            }
+            guard resolvedAddresses.contains(where: \.isRoutable) else {
+                throw MTASTSDiscoveryError.addressFilteredAsPrivate
+            }
         }
 
         let response: MTASTSHTTPResponse
@@ -281,9 +550,19 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         guard let contentType = response.contentType,
               contentType.lowercased().hasPrefix("text/plain")
         else { throw MTASTSDiscoveryError.invalidContentType }
+        // FIX C (protocol review): RFC 8461 §3.3 SHOULD, 64KB -- see
+        // `maximumPolicyResponseSizeBytes`'s doc comment. Checked after the
+        // full body is already buffered by `httpFetcher.fetch(url:)` (see
+        // that property's doc comment for why this codebase doesn't try to
+        // abort `URLSession` mid-stream), but before the body is ever
+        // decoded/parsed/cached/acted upon, which is the protection that
+        // actually matters.
+        guard response.body.count <= Self.maximumPolicyResponseSizeBytes else {
+            throw MTASTSDiscoveryError.responseTooLarge
+        }
 
         let text = String(decoding: response.body, as: UTF8.self)
         guard let policy = MTASTSPolicyParser.parse(text) else { throw MTASTSDiscoveryError.malformedPolicy }
-        return policy
+        return FetchedPolicy(policy: policy, discoveryID: record.id)
     }
 }
