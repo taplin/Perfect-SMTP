@@ -37,6 +37,16 @@ public struct MIMEComposer: Sendable {
         /// upstream, but composition fails loudly rather than silently
         /// emitting a malformed header.
         case invalidHeaderValue(String)
+        /// `EmailMessage.listUnsubscribe.postOneClick` was `true` but `url`
+        /// was `nil` — RFC 8058 §2's one-click mechanism is specifically
+        /// for the HTTPS POST target, so there is no URL for
+        /// `List-Unsubscribe-Post` to describe. A caller configuration
+        /// error, fails loud rather than silently omitting the header
+        /// (matching this composer's existing `missingBody`/
+        /// `forbiddenHeader` precedent for caller misconfiguration, as
+        /// opposed to the silent-strip precedent reserved for free-text
+        /// fields like Subject/display names).
+        case postOneClickRequiresURL
     }
 
     /// Case-insensitive denylist of header names `extraHeaders` may never
@@ -174,6 +184,22 @@ public struct MIMEComposer: Sendable {
         headers.append(("Subject", HeaderEncoder.encodeUnstructured(message.subject)))
         headers.append(contentsOf: Self.priorityHeaders(message.priority))
 
+        // Deliverability-hygiene headers (plan §7/§8, Phase 5): order
+        // relative to the rest of these general headers is not otherwise
+        // significant — confirmed against this codebase's one order-
+        // sensitive consumer, DKIM's `h=` canonicalization
+        // (`DKIMSigningInput`/`DKIMSigner`, Phase 2), which signs based on
+        // the actual header list *passed to the signer* (looked up by
+        // name against the already-composed message), not a fixed
+        // position, so inserting headers here doesn't disturb it.
+        headers.append(contentsOf: try listUnsubscribeHeaders())
+        if let precedence = message.precedence {
+            headers.append(("Precedence", precedence.rawValue))
+        }
+        if let autoSubmitted = message.autoSubmitted {
+            headers.append(("Auto-Submitted", autoSubmitted.rawValue))
+        }
+
         headers.append(("MIME-Version", "1.0"))
         headers.append(contentsOf: top.headers)
         headers.append(contentsOf: message.extraHeaders)
@@ -187,6 +213,57 @@ public struct MIMEComposer: Sendable {
         }
 
         return RFC5322Message(headers: headers, body: body)
+    }
+
+    /// Builds `List-Unsubscribe`/`List-Unsubscribe-Post` (RFC 8058, building
+    /// on the older RFC 2369) from `message.listUnsubscribe`, or `[]` when
+    /// unset. Both `mailto` and `url` are caller-supplied strings reaching
+    /// a raw header value exactly like the fields Phase 0's original
+    /// CRLF-injection fix covered — routed through the same
+    /// `requireNoInjection` (⇒ `HeaderEncoder.rejectHeaderInjection`)
+    /// discipline as every other caller-controlled header value in this
+    /// file, not a new, separately-invented check.
+    ///
+    /// Emission rules:
+    /// - `List-Unsubscribe` lists whichever of `mailto`/`url` are present,
+    ///   each wrapped in angle brackets, comma-separated if both — e.g.
+    ///   `<mailto:unsub@example.com>, <https://example.com/unsub?id=123>`.
+    ///   `mailto` is prefixed with the `mailto:` scheme here; `url` is
+    ///   used verbatim (it already carries its own scheme).
+    /// - Neither present (or `message.listUnsubscribe` itself is `nil`) →
+    ///   no headers at all.
+    /// - `postOneClick == true` requires `url` to be set — checked first,
+    ///   unconditionally, regardless of whether `mailto` is also present —
+    ///   since a caller who sets `postOneClick` with no `url` has made a
+    ///   configuration mistake this composer should surface, not paper
+    ///   over (`ComposerError.postOneClickRequiresURL`).
+    /// - `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is emitted
+    ///   verbatim when `postOneClick` is true — this value is a fixed
+    ///   literal per RFC 8058 §2, never caller-configurable.
+    private func listUnsubscribeHeaders() throws -> [(name: String, value: String)] {
+        guard let config = message.listUnsubscribe else { return [] }
+        if config.postOneClick, config.url == nil {
+            throw ComposerError.postOneClickRequiresURL
+        }
+
+        var entries: [String] = []
+        if let mailto = config.mailto {
+            try Self.requireNoInjection(mailto, field: "listUnsubscribe.mailto")
+            entries.append("<mailto:\(mailto)>")
+        }
+        if let url = config.url {
+            try Self.requireNoInjection(url, field: "listUnsubscribe.url")
+            entries.append("<\(url)>")
+        }
+        guard !entries.isEmpty else { return [] }
+
+        var headers: [(name: String, value: String)] = [
+            ("List-Unsubscribe", entries.joined(separator: ", ")),
+        ]
+        if config.postOneClick {
+            headers.append(("List-Unsubscribe-Post", "List-Unsubscribe=One-Click"))
+        }
+        return headers
     }
 
     // MARK: - Tree construction
