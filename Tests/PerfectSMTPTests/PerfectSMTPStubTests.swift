@@ -21,6 +21,6 @@ struct PerfectSMTPStubTests {
 
         let composed = try MIMEComposer(message).compose()
         #expect(!composed.headers.isEmpty)
-        #expect(ReversePath.null.mailFromCommand == "MAIL FROM:<>")
+        #expect(try ReversePath.null.mailFromCommand == "MAIL FROM:<>")
     }
 }

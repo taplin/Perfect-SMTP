@@ -96,43 +96,78 @@ public struct MIMEComposer: Sendable {
         "perfect-smtp-\(UUID().uuidString)"
     }
 
+    /// Routes a caller-controlled string through `HeaderEncoder`'s shared
+    /// `rejectHeaderInjection`, re-surfacing any control-character rejection
+    /// as this composer's own `ComposerError.invalidHeaderValue` — the
+    /// single call site every one of the milestone review's newly-covered
+    /// fields (`extraHeaders` names, `messageID`, `inReplyTo`, `references`,
+    /// attachment/inline `Content-Type`) goes through, so the fail-loud
+    /// discipline stays centralized in `HeaderEncoder` rather than being
+    /// re-implemented per field here.
+    private static func requireNoInjection(_ value: String, field: String) throws {
+        do {
+            _ = try HeaderEncoder.rejectHeaderInjection(value, field: field)
+        } catch is HeaderEncoder.HeaderInjectionError {
+            throw ComposerError.invalidHeaderValue(field)
+        }
+    }
+
     public func compose() throws -> RFC5322Message {
         for (name, value) in message.extraHeaders {
+            // Milestone review finding: the name was never checked for
+            // CR/LF, only the value — a mangled name like
+            // "X-Foo\r\nBcc" passed both the (name-based) denylist check
+            // and the (CR/LF-free) value check, a total bypass of the
+            // denylist that exists specifically to prevent this. Checked
+            // first, before the denylist lookup, so a mangled name is
+            // caught regardless of what it lowercases to.
+            try Self.requireNoInjection(name, field: name)
             if Self.forbiddenExtraHeaderNames.contains(name.lowercased()) {
                 throw ComposerError.forbiddenHeader(name)
             }
-            if value.contains("\r") || value.contains("\n") {
-                throw ComposerError.invalidHeaderValue(name)
-            }
+            try Self.requireNoInjection(value, field: name)
         }
         guard message.textBody != nil || message.htmlBody != nil else {
             throw ComposerError.missingBody
         }
 
-        let top = buildTopLevelPart()
+        let top = try buildTopLevelPart()
 
         var headers: [(name: String, value: String)] = []
-        headers.append(("From", HeaderEncoder.encodeAddress(message.from)))
+        headers.append(("From", try HeaderEncoder.encodeAddress(message.from)))
         if let sender = message.sender {
-            headers.append(("Sender", HeaderEncoder.encodeAddress(sender)))
+            headers.append(("Sender", try HeaderEncoder.encodeAddress(sender)))
         }
         if !message.replyTo.isEmpty {
-            headers.append(("Reply-To", HeaderEncoder.encodeAddressList(message.replyTo)))
+            headers.append(("Reply-To", try HeaderEncoder.encodeAddressList(message.replyTo)))
         }
         if !message.to.isEmpty {
-            headers.append(("To", HeaderEncoder.encodeAddressList(message.to)))
+            headers.append(("To", try HeaderEncoder.encodeAddressList(message.to)))
         }
         if !message.cc.isEmpty {
-            headers.append(("Cc", HeaderEncoder.encodeAddressList(message.cc)))
+            headers.append(("Cc", try HeaderEncoder.encodeAddressList(message.cc)))
         }
 
         headers.append(("Date", Self.rfc5322DateString(message.date ?? now())))
-        headers.append(("Message-ID", message.messageID ?? synthesizeMessageID()))
+        if let messageID = message.messageID {
+            // Only the caller-supplied case needs validating — the
+            // synthesized fallback is a UUID plus a domain already
+            // validated above via the "From" header's `encodeAddress`
+            // call, so it can't carry an injection payload.
+            try Self.requireNoInjection(messageID, field: "messageID")
+            headers.append(("Message-ID", messageID))
+        } else {
+            headers.append(("Message-ID", synthesizeMessageID()))
+        }
 
         if let inReplyTo = message.inReplyTo {
+            try Self.requireNoInjection(inReplyTo, field: "inReplyTo")
             headers.append(("In-Reply-To", inReplyTo))
         }
         if !message.references.isEmpty {
+            for reference in message.references {
+                try Self.requireNoInjection(reference, field: "references")
+            }
             headers.append(("References", message.references.joined(separator: " ")))
         }
 
@@ -156,7 +191,7 @@ public struct MIMEComposer: Sendable {
 
     // MARK: - Tree construction
 
-    private func buildTopLevelPart() -> MIMEPart {
+    private func buildTopLevelPart() throws -> MIMEPart {
         var bodyParts: [MIMEPart] = []
         if let text = message.textBody {
             bodyParts.append(textLeaf(text, subtype: "plain"))
@@ -180,7 +215,7 @@ public struct MIMEComposer: Sendable {
         if !message.inlineImages.isEmpty {
             let boundary = boundaryGenerator()
             var parts = [alternativeOrSingle]
-            parts.append(contentsOf: message.inlineImages.map(inlineLeaf))
+            parts.append(contentsOf: try message.inlineImages.map(inlineLeaf))
             relatedOrSingle = MIMEPart(
                 headers: [("Content-Type", "multipart/related; boundary=\"\(boundary)\"")],
                 body: .multipart(boundary: boundary, parts: parts)
@@ -192,7 +227,7 @@ public struct MIMEComposer: Sendable {
         if !message.attachments.isEmpty {
             let boundary = boundaryGenerator()
             var parts = [relatedOrSingle]
-            parts.append(contentsOf: message.attachments.map(attachmentLeaf))
+            parts.append(contentsOf: try message.attachments.map(attachmentLeaf))
             return MIMEPart(
                 headers: [("Content-Type", "multipart/mixed; boundary=\"\(boundary)\"")],
                 body: .multipart(boundary: boundary, parts: parts)
@@ -221,7 +256,12 @@ public struct MIMEComposer: Sendable {
         )
     }
 
-    private func attachmentLeaf(_ attachment: Attachment) -> MIMEPart {
+    private func attachmentLeaf(_ attachment: Attachment) throws -> MIMEPart {
+        // Milestone review finding: `contentType` was interpolated raw
+        // into this part's own Content-Type header line — a value like
+        // "text/plain\r\nX-Injected-CT: yes" injected an extra header
+        // line inside the attachment's own part.
+        try Self.requireNoInjection(attachment.contentType, field: "attachment.contentType")
         let disposition = attachment.disposition ?? message.defaultDisposition
         let name = sanitizedFilename(attachment.filename)
         return MIMEPart(
@@ -234,7 +274,8 @@ public struct MIMEComposer: Sendable {
         )
     }
 
-    private func inlineLeaf(_ resource: InlineResource) -> MIMEPart {
+    private func inlineLeaf(_ resource: InlineResource) throws -> MIMEPart {
+        try Self.requireNoInjection(resource.contentType, field: "inlineResource.contentType")
         var headers: [(name: String, value: String)] = []
         if let filename = resource.filename {
             let name = sanitizedFilename(filename)
@@ -288,8 +329,22 @@ public struct MIMEComposer: Sendable {
     /// upload filename. Non-ASCII filenames are passed through as raw
     /// UTF-8 inside the quoted-string; full RFC 2231 parameter-value
     /// continuation/encoding is not implemented in Phase 0 (see report).
+    ///
+    /// Also hardened against path traversal (milestone review finding):
+    /// a filename like "../../../../etc/passwd" previously passed straight
+    /// through into `Content-Disposition: attachment; filename="..."`.
+    /// Basename the string — keep only the component after the last path
+    /// separator (`/` or `\`, covering both POSIX and Windows-style
+    /// caller input, including stripping a leading drive letter as a side
+    /// effect of basenaming) — then strip any remaining leading dots.
     private func sanitizedFilename(_ name: String) -> String {
-        String(String.UnicodeScalarView(name.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }))
+        let controlFree = String(
+            String.UnicodeScalarView(name.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F })
+        )
+        let lastSeparator = controlFree.lastIndex(where: { $0 == "/" || $0 == "\\" })
+        let base = lastSeparator.map { String(controlFree[controlFree.index(after: $0)...]) } ?? controlFree
+        let noLeadingDots = String(base.drop(while: { $0 == "." }))
+        return noLeadingDots.isEmpty ? "_" : noLeadingDots
     }
 
     private func quotedParam(_ value: String) -> String {

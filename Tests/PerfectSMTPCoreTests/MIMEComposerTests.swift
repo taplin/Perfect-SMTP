@@ -232,6 +232,56 @@ struct MIMEComposerTests {
             _ = try MIMEComposer(message).compose()
         }
     }
+
+    // MARK: - Milestone review finding #7: path traversal in filenames
+
+    @Test func pathTraversalAttachmentFilenameDoesNotSurviveIntoContentDisposition() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        message.attachments = [
+            Attachment(filename: "../../../../etc/passwd", contentType: "text/plain", data: Data("hi".utf8)),
+        ]
+
+        let composed = try MIMEComposer(message).compose()
+        let body = String(decoding: composed.body, as: UTF8.self)
+
+        #expect(!body.contains(".."))
+        #expect(!body.contains("/etc/passwd"))
+        #expect(body.contains("filename=\"passwd\""))
+    }
+
+    @Test func pathTraversalInlineResourceFilenameDoesNotSurviveIntoContentDisposition() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        message.inlineImages = [
+            InlineResource(
+                contentID: "img1",
+                filename: "..\\..\\windows\\win.ini",
+                contentType: "image/png",
+                data: Data([0, 1, 2])
+            ),
+        ]
+
+        let composed = try MIMEComposer(message).compose()
+        let body = String(decoding: composed.body, as: UTF8.self)
+
+        #expect(!body.contains(".."))
+        #expect(!body.contains("windows\\win.ini"))
+        #expect(body.contains("filename=\"win.ini\""))
+    }
+
+    @Test func leadingSlashFilenameIsBasenamed() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        message.attachments = [
+            Attachment(filename: "/etc/passwd", contentType: "text/plain", data: Data("hi".utf8)),
+        ]
+
+        let composed = try MIMEComposer(message).compose()
+        let body = String(decoding: composed.body, as: UTF8.self)
+        #expect(body.contains("filename=\"passwd\""))
+        #expect(!body.contains("/etc/passwd"))
+    }
 }
 
 private func header(_ message: RFC5322Message, _ name: String) -> String? {

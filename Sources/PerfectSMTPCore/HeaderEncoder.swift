@@ -18,6 +18,19 @@
 //      character phrases use an ordinary quoted-string; never both on the
 //      same phrase.
 //
+//  Milestone review finding (architect/protocol/security passes, all
+//  independently converging on the same root cause): the CR/LF-stripping
+//  sanitization here was originally applied only to Subject text and
+//  display-name phrases (`sanitizeForHeader`, below), never extended to
+//  the other caller-controlled strings that also end up embedded raw into
+//  an RFC 5322 header line or an SMTP command line — reopening Bug #1
+//  (the Bcc-header-leak bug) through addresses, `extraHeaders` names,
+//  `Message-ID`/`In-Reply-To`/`References`, MIME part `Content-Type`, and
+//  the SMTP `MAIL FROM`/`RCPT TO` command lines. `rejectHeaderInjection`
+//  below is the single, uniformly-applied discipline every one of those
+//  call sites now routes through, instead of another set of scattered
+//  per-field patches.
+//
 
 import Foundation
 
@@ -59,28 +72,85 @@ public enum HeaderEncoder {
 
     /// Encodes one mailbox as `phrase <addr-spec>`, or just the addr-spec
     /// if there's no display name.
-    public static func encodeAddress(_ address: EmailAddress) -> String {
+    ///
+    /// The addr-spec itself (unlike the display-name phrase, which goes
+    /// through `encodePhrase`'s silent `sanitizeForHeader` stripping) is
+    /// routed through the fail-loud `rejectHeaderInjection` instead:
+    /// silently stripping CR/LF out of an address could mask a real caller
+    /// bug (a mangled address is a caller-visible error, not something to
+    /// quietly "fix" into a different, unintended address), matching this
+    /// codebase's existing `extraHeaders`-value precedent
+    /// (`ComposerError.invalidHeaderValue`, thrown rather than stripped).
+    public static func encodeAddress(_ address: EmailAddress) throws -> String {
+        let addrSpec = try rejectHeaderInjection(address.address, field: "address")
         guard let name = address.displayName, !name.isEmpty else {
-            return address.address
+            return addrSpec
         }
-        return "\(encodePhrase(name)) <\(address.address)>"
+        return "\(encodePhrase(name)) <\(addrSpec)>"
     }
 
     /// Encodes a comma-separated mailbox list for `To:`/`Cc:`/`Reply-To:`.
-    public static func encodeAddressList(_ addresses: [EmailAddress]) -> String {
-        addresses.map(encodeAddress).joined(separator: ", ")
+    public static func encodeAddressList(_ addresses: [EmailAddress]) throws -> String {
+        try addresses.map { try encodeAddress($0) }.joined(separator: ", ")
     }
 
     // MARK: - Internals
 
-    /// Strips CR/LF from header input to prevent header injection — a
-    /// header value containing raw line breaks could otherwise be used to
-    /// smuggle additional headers (or, in the worst case, a fake `Bcc:`)
-    /// past the composer's denylist. Not explicitly named by the plan, but
-    /// directly in the spirit of the Bug #1 fix.
+    /// Thrown by `rejectHeaderInjection` when a caller-controlled string
+    /// destined for a header line or SMTP command line contains a control
+    /// character that could be used to inject an additional line.
+    public enum HeaderInjectionError: Error, Sendable, Equatable {
+        case controlCharacterInField(String)
+    }
+
+    /// True for any C0 control character (0x00–0x1F) or DEL (0x7F) — the
+    /// character class that must never survive, unescaped, into a string
+    /// bound for an RFC 5322 header line or an SMTP command line. This is
+    /// broader than just CR/LF: it also covers other C0 controls such as
+    /// ESC (0x1B), which are not RFC 5322-structure injection vectors but
+    /// are a terminal-escape-sequence-injection risk for any tool that
+    /// renders headers to a terminal without its own escaping (milestone
+    /// review finding — a `quoted-string` only escapes `\` and `"`, not
+    /// control characters, so a control byte in a display name survives
+    /// straight through `quotedString` below).
+    private static func isForbiddenControlScalar(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value <= 0x1F || scalar.value == 0x7F
+    }
+
+    /// The single, uniformly-applied discipline for every caller-controlled
+    /// string that ends up embedded raw into an RFC 5322 header line or an
+    /// SMTP command line — routed through by every one of the call sites
+    /// identified in the milestone review: `encodeAddress`'s addr-spec,
+    /// `MIMEComposer`'s `extraHeaders` names (previously unchecked — the
+    /// full-Bcc-injection bypass), `messageID`/`inReplyTo`/`references`,
+    /// attachment/inline `Content-Type`, and `SMTPEnvelope`/`ReversePath`'s
+    /// `MAIL FROM`/`RCPT TO` addr-specs. Throws (fail loud) rather than
+    /// silently stripping, matching the existing `extraHeaders`-value
+    /// precedent — a caller that manages to construct a string containing
+    /// a control character here almost certainly has a bug worth
+    /// surfacing, not silently "fixing".
+    public static func rejectHeaderInjection(_ value: String, field: String) throws -> String {
+        guard !value.unicodeScalars.contains(where: isForbiddenControlScalar) else {
+            throw HeaderInjectionError.controlCharacterInField(field)
+        }
+        return value
+    }
+
+    /// Strips control characters (CR/LF and the rest of the C0 range, plus
+    /// DEL) from free-text header input in place, to prevent header
+    /// injection — a header value containing raw line breaks could
+    /// otherwise be used to smuggle additional headers (or, in the worst
+    /// case, a fake `Bcc:`) past the composer's denylist. Applied to
+    /// Subject text and display-name phrases, where free-form user text is
+    /// expected and silent stripping (rather than throwing) is the
+    /// established, documented precedent for this specific pair of call
+    /// sites (`encodeUnstructured`/`encodePhrase`) — everywhere else now
+    /// routes through the fail-loud `rejectHeaderInjection` above instead.
+    /// Originally CR/LF-only; broadened to the full C0 control-character
+    /// range (milestone review finding — see `isForbiddenControlScalar`).
     private static func sanitizeForHeader(_ text: String) -> String {
-        guard text.contains("\r") || text.contains("\n") else { return text }
-        return String(String.UnicodeScalarView(text.unicodeScalars.filter { $0 != "\r" && $0 != "\n" }))
+        guard text.unicodeScalars.contains(where: isForbiddenControlScalar) else { return text }
+        return String(String.UnicodeScalarView(text.unicodeScalars.filter { !isForbiddenControlScalar($0) }))
     }
 
     private static func needsEncoding(_ text: String) -> Bool {

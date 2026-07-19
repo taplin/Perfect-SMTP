@@ -18,12 +18,29 @@ public enum ReversePath: Sendable, Hashable {
 
     /// The literal `MAIL FROM:<...>` command text. `.null` serializes to
     /// exactly `MAIL FROM:<>`.
+    ///
+    /// Milestone review finding (security pass): the `.address` case
+    /// previously embedded `address` raw into the command line — SMTP
+    /// **command** injection (RFC 5321 §4.1.2's `addr-spec` grammar
+    /// forbids CR/LF in a mailbox), not just header injection, and reaches
+    /// the wire once Phase 1 wires this envelope type into the real
+    /// connection. Now routed through the same `rejectHeaderInjection`
+    /// character-class check `HeaderEncoder` uses for RFC 5322 header
+    /// lines — the character class that must never appear unescaped is
+    /// identical even though this is a command line, not a header.
+    /// `throws` (rather than silently stripping) for the same reason
+    /// `HeaderEncoder.encodeAddress` throws: a mangled reverse-path
+    /// address is a caller bug worth surfacing, not something to quietly
+    /// "fix" into a different address.
     public var mailFromCommand: String {
-        switch self {
-        case .address(let address):
-            return "MAIL FROM:<\(address)>"
-        case .null:
-            return "MAIL FROM:<>"
+        get throws {
+            switch self {
+            case .address(let address):
+                let validated = try HeaderEncoder.rejectHeaderInjection(address, field: "MAIL FROM address")
+                return "MAIL FROM:<\(validated)>"
+            case .null:
+                return "MAIL FROM:<>"
+            }
         }
     }
 }
@@ -63,11 +80,25 @@ public struct DSNRequest: Sendable, Hashable {
 /// header.
 public struct SMTPEnvelope: Sendable {
     public var mailFrom: ReversePath
+    /// Destined for individual `RCPT TO` commands. No transport consumes
+    /// this in Phase 0, but the identical unenforced-raw-string pattern as
+    /// `ReversePath.address`'s addr-spec exists here too (milestone review
+    /// finding) — validated at construction time below so the gap isn't
+    /// carried forward silently into Phase 1. Note this is a mutable
+    /// stored property: a caller that mutates `recipients` after
+    /// construction bypasses this check, same as any other value-type
+    /// invariant enforced only in an `init` — Phase 1's transport layer,
+    /// which actually emits `RCPT TO` on the wire, is the place a
+    /// stronger guarantee (e.g. re-validating immediately before send)
+    /// belongs.
     public var recipients: [String]
     public var size: Int?
     public var dsn: DSNRequest?
 
-    public init(mailFrom: ReversePath, recipients: [String], size: Int? = nil, dsn: DSNRequest? = nil) {
+    public init(mailFrom: ReversePath, recipients: [String], size: Int? = nil, dsn: DSNRequest? = nil) throws {
+        for recipient in recipients {
+            _ = try HeaderEncoder.rejectHeaderInjection(recipient, field: "RCPT TO address")
+        }
         self.mailFrom = mailFrom
         self.recipients = recipients
         self.size = size

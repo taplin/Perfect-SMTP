@@ -116,21 +116,58 @@ struct HeaderEncoderTests {
 
     // MARK: - Address / address-list encoding
 
-    @Test func addressWithoutDisplayNameIsJustTheAddrSpec() {
+    @Test func addressWithoutDisplayNameIsJustTheAddrSpec() throws {
         let address = EmailAddress(address: "user@example.com")
-        #expect(HeaderEncoder.encodeAddress(address) == "user@example.com")
+        #expect(try HeaderEncoder.encodeAddress(address) == "user@example.com")
     }
 
-    @Test func addressWithPlainDisplayName() {
+    @Test func addressWithPlainDisplayName() throws {
         let address = EmailAddress(displayName: "Jane Doe", address: "jane@example.com")
-        #expect(HeaderEncoder.encodeAddress(address) == "Jane Doe <jane@example.com>")
+        #expect(try HeaderEncoder.encodeAddress(address) == "Jane Doe <jane@example.com>")
     }
 
-    @Test func addressListJoinsWithCommaSpace() {
+    @Test func addressListJoinsWithCommaSpace() throws {
         let list = [
             EmailAddress(address: "a@example.com"),
             EmailAddress(displayName: "B", address: "b@example.com"),
         ]
-        #expect(HeaderEncoder.encodeAddressList(list) == "a@example.com, B <b@example.com>")
+        #expect(try HeaderEncoder.encodeAddressList(list) == "a@example.com, B <b@example.com>")
+    }
+
+    // MARK: - Milestone review finding #1: address addr-spec CRLF injection
+
+    @Test func addressAddrSpecInjectionAttemptThrows() {
+        // Repro from the milestone review (architect/protocol/security
+        // passes, all independently converging on this): the addr-spec
+        // was returned completely raw, letting a caller-supplied address
+        // inject a whole extra header line, including a live Bcc.
+        let address = EmailAddress(address: "victim@example.com>\r\nBcc: attacker@evil.com\r\nX-Injected: yes")
+        #expect(throws: HeaderEncoder.HeaderInjectionError.self) {
+            _ = try HeaderEncoder.encodeAddress(address)
+        }
+    }
+
+    @Test func addressListInjectionAttemptThrows() {
+        let list = [
+            EmailAddress(address: "user@dest.com"),
+            EmailAddress(address: "victim@example.com>\r\nBcc: attacker@evil.com"),
+        ]
+        #expect(throws: HeaderEncoder.HeaderInjectionError.self) {
+            _ = try HeaderEncoder.encodeAddressList(list)
+        }
+    }
+
+    // MARK: - Milestone review finding #6: control characters beyond CR/LF
+
+    @Test func displayNameWithEscapeControlCharacterIsStripped() {
+        // A display name containing ESC (0x1B) previously survived into a
+        // quoted-string unescaped (quoted-string only escapes `\` and
+        // `"`) — a terminal-escape-sequence-injection risk. sanitizeForHeader
+        // is broadened (silent-strip precedent, matching Subject/display-name
+        // handling) to cover the full C0 range, not just CR/LF.
+        let name = "Evil\u{1B}[31mName"
+        let encoded = HeaderEncoder.encodePhrase(name)
+        #expect(!encoded.unicodeScalars.contains(Unicode.Scalar(0x1B)!))
+        #expect(!encoded.contains("\u{1B}"))
     }
 }
