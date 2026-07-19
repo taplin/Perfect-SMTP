@@ -10,6 +10,7 @@
 //  is sugar over it.
 //
 
+import Logging
 import NIOCore
 
 public struct SMTPMailer: Sendable {
@@ -24,18 +25,30 @@ public struct SMTPMailer: Sendable {
     }
 
     private let transport: any SMTPTransport
-    /// Pluggable, optional signing step -- the seam Phase 2's `DKIMSigner`
-    /// will conform to (see `PerfectSMTPCore/MessageSigner.swift`). `nil`
-    /// means "no DKIM step": the composed `RFC5322Message` is serialized
+    /// Pluggable, optional signing step -- Phase 2's `DKIMSigner` conforms
+    /// to this (see `PerfectSMTPCore/MessageSigner.swift`). `nil` means
+    /// "no DKIM step": the composed `RFC5322Message` is serialized
     /// straight into `SignedMessage.rfc5322` with no signing at all, which
     /// is what makes Phase 1 a fully working mailer on its own.
     private let signer: (any MessageSigner)?
     private let configuration: Configuration
+    /// Only ever used for the DKIM DMARC-alignment lint below (plan
+    /// §4.6) -- `PerfectSMTPCore` deliberately stays free of a swift-log
+    /// dependency (see `DKIMSigner.isAligned(withFromDomain:)`'s doc
+    /// comment), so this is the one place in the mailer that actually
+    /// emits a log line, kept intentionally narrow in scope.
+    private let logger: Logger
 
-    public init(transport: any SMTPTransport, signer: (any MessageSigner)? = nil, configuration: Configuration = .init()) {
+    public init(
+        transport: any SMTPTransport,
+        signer: (any MessageSigner)? = nil,
+        configuration: Configuration = .init(),
+        logger: Logger = Logger(label: "PerfectSMTP.SMTPMailer")
+    ) {
         self.transport = transport
         self.signer = signer
         self.configuration = configuration
+        self.logger = logger
     }
 
     /// Single-message send. `bcc` is supplied separately, never on
@@ -141,6 +154,21 @@ public struct SMTPMailer: Sendable {
         let finalMessage: RFC5322Message
         if let signer {
             finalMessage = try signer.sign(composed)
+            // DMARC-alignment lint (plan §4.6): a type-check against the
+            // concrete `DKIMSigner`, not a `MessageSigner` protocol
+            // requirement -- keeping the alignment check itself as pure
+            // data on `DKIMSigner` (in the no-swift-log `PerfectSMTPCore`
+            // target) and doing the actual logging only here, in the NIO
+            // target that already depends on swift-log. Never a hard
+            // error: misalignment is sometimes intentional (e.g.
+            // third-party sending infrastructure), so this only ever logs
+            // a warning and always proceeds with sending.
+            if let dkim = signer as? DKIMSigner, !dkim.isAligned(withFromDomain: message.from.address) {
+                logger.warning(
+                    "DKIM d= domain does not DMARC-align with the From: header domain",
+                    metadata: ["from": "\(message.from.address)"]
+                )
+            }
         } else {
             finalMessage = composed
         }
