@@ -1,0 +1,199 @@
+//
+//  DNSTestFixtures.swift
+//  PerfectSMTPTests
+//
+//  Real-world byte fixtures, captured against live nameservers during
+//  development (a raw-socket Python script sending hand-built RFC 1035
+//  queries directly to `8.8.8.8:53` and recording the exact bytes on the
+//  wire -- `dig` itself doesn't expose raw bytes, only its own parsed
+//  rendering) so the wire-codec tests exercise real compression pointers,
+//  a real null-MX record, a real CNAME chain, and a real NXDOMAIN/SOA
+//  response, not just self-consistent round-trips of this package's own
+//  encoder. None of the tests that use these fixtures touch the network
+//  themselves -- the bytes below are the network access, done once, ahead
+//  of time.
+//
+//  `example.com` genuinely has no mail exchanger and publishes exactly the
+//  RFC 7505 null-MX record (`0 .`) -- confirmed live, not a synthetic
+//  stand-in. `google.com`'s MX and `www.github.com`'s A both exercise real
+//  compression (the former inside an MX record's RDATA, the latter a
+//  pointer into the middle of a previously-seen name).
+//
+//  `TestDNSMessageBuilder` (bottom of this file) hand-encodes *synthetic*
+//  responses (a CNAME cycle, a truncation stub) that no real server would
+//  ever legitimately send -- used by the fake-local-server tests
+//  (`DNSTransportTests`, `DNSResolverCNAMEFollowingTests`) that need
+//  specific, deterministic, adversarial-shaped responses a live query can't
+//  provide on demand.
+//
+
+enum DNSTestFixtures {
+    // MARK: - example.com A (qid 0x1111) -- two A records, name-compressed via 0xc00c
+
+    static let exampleComAQueryID: UInt16 = 0x1111
+    static let exampleComAQuery: [UInt8] = [
+        0x11, 0x11, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+        0x00, 0x00, 0x01, 0x00, 0x01,
+    ]
+    static let exampleComAResponse: [UInt8] = [
+        0x11, 0x11, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x01, 0x03, 0x00, 0x04, 0x68, 0x14, 0x17, 0x9a, 0xc0, 0x0c, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x03, 0x00, 0x04, 0xac, 0x42, 0x93,
+        0xf3,
+    ]
+
+    // MARK: - example.com AAAA (qid 0x2222) -- two AAAA records, name-compressed
+
+    static let exampleComAAAAQueryID: UInt16 = 0x2222
+    static let exampleComAAAAResponse: [UInt8] = [
+        0x22, 0x22, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+        0x00, 0x00, 0x1c, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00,
+        0x00, 0x01, 0x2c, 0x00, 0x10, 0x26, 0x06, 0x47, 0x00, 0x00, 0x10, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x42, 0x93, 0xf3, 0xc0, 0x0c, 0x00,
+        0x1c, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c, 0x00, 0x10, 0x26, 0x06, 0x47,
+        0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x14, 0x17,
+        0x9a,
+    ]
+
+    // MARK: - example.com MX (qid 0x3333) -- the real RFC 7505 null-MX record ("0 .")
+
+    static let exampleComMXQueryID: UInt16 = 0x3333
+    static let exampleComNullMXResponse: [UInt8] = [
+        0x33, 0x33, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+        0x00, 0x00, 0x0f, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x0f, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0xd1, 0x00, 0x03, 0x00, 0x00, 0x00,
+    ]
+
+    // MARK: - google.com MX (qid 0x4444) -- "10 smtp.google.com.", exchange compressed mid-RDATA
+
+    static let googleComMXQueryID: UInt16 = 0x4444
+    static let googleComMXResponse: [UInt8] = [
+        0x44, 0x44, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00,
+        0x00, 0x0f, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x0f, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x0c, 0x00, 0x09, 0x00, 0x0a, 0x04, 0x73, 0x6d, 0x74, 0x70, 0xc0,
+        0x0c,
+    ]
+
+    // MARK: - www.github.com A (qid 0x5555) -- a real CNAME chain (www.github.com -> github.com -> A)
+
+    static let wwwGithubComQueryID: UInt16 = 0x5555
+    static let wwwGithubComResponse: [UInt8] = [
+        0x55, 0x55, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x03, 0x77, 0x77, 0x77, 0x06, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x03,
+        0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x05,
+        0x00, 0x01, 0x00, 0x00, 0x0d, 0xe4, 0x00, 0x02, 0xc0, 0x10, 0xc0, 0x10,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 0x8c, 0x52,
+        0x70, 0x03,
+    ]
+
+    // MARK: - nxdomain-test-perfectsmtp.invalid A (qid 0x6666) -- NXDOMAIN, SOA in authority (an unrecognized/generic-skip type)
+
+    static let nxdomainQueryID: UInt16 = 0x6666
+    static let nxdomainResponse: [UInt8] = [
+        0x66, 0x66, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x19, 0x6e, 0x78, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2d, 0x74, 0x65,
+        0x73, 0x74, 0x2d, 0x70, 0x65, 0x72, 0x66, 0x65, 0x63, 0x74, 0x73, 0x6d,
+        0x74, 0x70, 0x07, 0x69, 0x6e, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 0x01, 0x51, 0x7e,
+        0x00, 0x40, 0x01, 0x61, 0x0c, 0x72, 0x6f, 0x6f, 0x74, 0x2d, 0x73, 0x65,
+        0x72, 0x76, 0x65, 0x72, 0x73, 0x03, 0x6e, 0x65, 0x74, 0x00, 0x05, 0x6e,
+        0x73, 0x74, 0x6c, 0x64, 0x0c, 0x76, 0x65, 0x72, 0x69, 0x73, 0x69, 0x67,
+        0x6e, 0x2d, 0x67, 0x72, 0x73, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x78, 0xc3,
+        0x66, 0xf9, 0x00, 0x00, 0x07, 0x08, 0x00, 0x00, 0x03, 0x84, 0x00, 0x09,
+        0x3a, 0x80, 0x00, 0x01, 0x51, 0x80,
+    ]
+}
+
+/// A tiny, test-only, no-compression DNS message encoder for shapes real
+/// live queries can't hand us on demand: a CNAME cycle, a truncation stub.
+/// Deliberately not part of `DNSWireFormat.swift` -- production code only
+/// ever needs to *encode a query*, never an arbitrary response; encoding
+/// full synthetic responses is purely a test-fixture concern.
+enum TestDNSMessageBuilder {
+    static func header(
+        id: UInt16, isResponse: Bool, truncated: Bool = false, ancount: UInt16, qdcount: UInt16 = 1
+    ) -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.append(UInt8(id >> 8)); bytes.append(UInt8(id & 0xFF))
+        var flags1: UInt8 = 0
+        if isResponse { flags1 |= 0x80 }
+        if truncated { flags1 |= 0x02 }
+        flags1 |= 0x01 // RD
+        bytes.append(flags1)
+        bytes.append(0x80) // RA=1
+        appendUInt16(qdcount, &bytes)
+        appendUInt16(ancount, &bytes)
+        appendUInt16(0, &bytes) // NSCOUNT
+        appendUInt16(0, &bytes) // ARCOUNT
+        return bytes
+    }
+
+    static func name(_ name: String) -> [UInt8] {
+        var bytes: [UInt8] = []
+        let trimmed = name.hasSuffix(".") ? String(name.dropLast()) : name
+        if !trimmed.isEmpty {
+            for label in trimmed.split(separator: ".", omittingEmptySubsequences: false) {
+                let labelBytes = Array(label.utf8)
+                bytes.append(UInt8(labelBytes.count))
+                bytes.append(contentsOf: labelBytes)
+            }
+        }
+        bytes.append(0)
+        return bytes
+    }
+
+    static func question(name qname: String, type: UInt16) -> [UInt8] {
+        var bytes = name(qname)
+        appendUInt16(type, &bytes)
+        appendUInt16(1, &bytes) // IN
+        return bytes
+    }
+
+    /// One CNAME resource record, uncompressed: `owner CNAME target`.
+    static func cnameRecord(owner: String, target: String, ttl: UInt32 = 60) -> [UInt8] {
+        var bytes = name(owner)
+        appendUInt16(5, &bytes) // TYPE=CNAME
+        appendUInt16(1, &bytes) // CLASS=IN
+        appendUInt32(ttl, &bytes)
+        let rdata = name(target)
+        appendUInt16(UInt16(rdata.count), &bytes)
+        bytes.append(contentsOf: rdata)
+        return bytes
+    }
+
+    /// A complete response: header + one question + `records` (already
+    /// wire-encoded, e.g. via `cnameRecord`).
+    static func response(id: UInt16, qname: String, qtype: UInt16, records: [[UInt8]]) -> [UInt8] {
+        var bytes = header(id: id, isResponse: true, ancount: UInt16(records.count))
+        bytes.append(contentsOf: question(name: qname, type: qtype))
+        for record in records { bytes.append(contentsOf: record) }
+        return bytes
+    }
+
+    /// A `TC=1`, zero-answer stub -- what `DNSTransportTests` hands back
+    /// over UDP to force a TCP retry, echoing the incoming query's question
+    /// section (a real truncated response still includes the question).
+    static func truncatedStub(id: UInt16, qname: String, qtype: UInt16) -> [UInt8] {
+        var bytes = header(id: id, isResponse: true, truncated: true, ancount: 0)
+        bytes.append(contentsOf: question(name: qname, type: qtype))
+        return bytes
+    }
+
+    private static func appendUInt16(_ value: UInt16, _ bytes: inout [UInt8]) {
+        bytes.append(UInt8(value >> 8))
+        bytes.append(UInt8(value & 0xFF))
+    }
+
+    private static func appendUInt32(_ value: UInt32, _ bytes: inout [UInt8]) {
+        bytes.append(UInt8((value >> 24) & 0xFF))
+        bytes.append(UInt8((value >> 16) & 0xFF))
+        bytes.append(UInt8((value >> 8) & 0xFF))
+        bytes.append(UInt8(value & 0xFF))
+    }
+}
