@@ -249,6 +249,60 @@ struct DKIMSignerTests {
         }
     }
 
+    // MARK: - FIX #2 (milestone review, security pass): domain/selector
+    // reach the signed `DKIM-Signature` header value unsanitized -- reject
+    // CR/LF (and other C0 control characters) at construction time, the
+    // same fail-loud discipline `HeaderEncoder.rejectHeaderInjection`
+    // already applies to every other caller-controlled string embedded raw
+    // into a header line.
+
+    @Test func constructingWithACRLFLacedDomainThrows() throws {
+        #expect(throws: (any Error).self) {
+            _ = try DKIMSigner(
+                domain: "example.com\r\nX-Injected: evil", selector: "s1", signedHeaders: ["from"],
+                keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+            )
+        }
+    }
+
+    @Test func constructingWithACRLFLacedSelectorThrows() throws {
+        #expect(throws: (any Error).self) {
+            _ = try DKIMSigner(
+                domain: "example.com", selector: "s1\r\nX-Injected: evil", signedHeaders: ["from"],
+                keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+            )
+        }
+    }
+
+    // MARK: - FIX #3 (milestone review, security pass): redacted
+    // description so an accidental `"\(signingKey)"`/`"\(dkimSigner)"`
+    // interpolation can never leak key material.
+
+    @Test func signingKeyDescriptionIsRedactedAndNamesTheAlgorithm() throws {
+        let rsaKey = try SigningKey.rsa(pem: Self.rsa2048PEM)
+        let ed25519Key = try SigningKey.ed25519(rawRepresentation: Data(repeating: 7, count: 32))
+        #expect("\(rsaKey)" == "SigningKey(algorithm: rsa, <redacted>)")
+        #expect("\(ed25519Key)" == "SigningKey(algorithm: ed25519, <redacted>)")
+        #expect(String(reflecting: rsaKey) == "SigningKey(algorithm: rsa, <redacted>)")
+    }
+
+    /// Confirms `DKIMSigner`'s default, reflection-based description
+    /// recurses into `SigningKey`'s own safe description for each element
+    /// of `keys` -- i.e. that no separate `CustomStringConvertible`
+    /// override is needed on `DKIMSigner` itself (see the doc comment on
+    /// `DKIMSigner`'s stored properties).
+    @Test func dkimSignerDescriptionRedactsItsKeysAndNeverContainsRawKeyMaterial() throws {
+        let signer = try DKIMSigner(
+            domain: "example.com", selector: "s1", signedHeaders: ["from"],
+            keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+        )
+        let description = "\(signer)"
+        #expect(description.contains("SigningKey(algorithm: rsa, <redacted>)"))
+        // The PEM's base64 body must never appear in the description --
+        // spot-check a distinctive substring from the middle of the key.
+        #expect(!description.contains("wYYqnvIW69nFbGXs"))
+    }
+
     // MARK: - DMARC-alignment lint (pure data, no logging in this target)
 
     @Test func isAlignedIsTrueForAnExactDomainMatch() throws {
@@ -269,5 +323,50 @@ struct DKIMSignerTests {
     @Test func isAlignedIsFalseForAMalformedFromAddressWithNoAtSign() throws {
         let signer = try DKIMSigner(domain: "example.com", selector: "s1", signedHeaders: [], keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)])
         #expect(!signer.isAligned(withFromDomain: "not-an-address"))
+    }
+
+    // MARK: - FIX #1 (milestone review, DKIM/RFC-protocol expert pass):
+    // isAligned must be a symmetric Organizational-Domain check, and must
+    // reject a bare public suffix as `d=` per RFC 7489 §3.1.1's own named
+    // example ("d=com" can never be "in alignment").
+
+    /// Real bug #1 (false negative): a standard ESP/bulk-sender
+    /// subdomain-signing config -- `d=bounces.example.com` signing
+    /// `From: user@example.com` -- reduces to the same Organizational
+    /// Domain (`example.com`) and RFC 7489 says it SHOULD align. The old
+    /// one-directional check (`from` must be a descendant of `d`) reported
+    /// this as misaligned; the fixed, symmetric check must not.
+    @Test func isAlignedIsTrueForAnESPSubdomainSigningTheParentFromDomain() throws {
+        let signer = try DKIMSigner(
+            domain: "bounces.example.com", selector: "s1", signedHeaders: [],
+            keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+        )
+        #expect(signer.isAligned(withFromDomain: "user@example.com"))
+    }
+
+    /// Real bug #2 (false positive): RFC 7489 §3.1.1 explicitly forbids
+    /// treating a bare public suffix as an Organizational Domain -- "a DKIM
+    /// signature bearing a value of 'd=com' would never allow an 'in
+    /// alignment' result ... and therefore cannot be an Organizational
+    /// Domain." `co.uk` is the RFC's own class of example (a common
+    /// multi-label public suffix); `d=co.uk` must never align with any
+    /// `*.co.uk` address, even though it would satisfy a naive suffix check.
+    @Test func isAlignedIsFalseWhenDIsABarePublicSuffix() throws {
+        let signer = try DKIMSigner(
+            domain: "co.uk", selector: "s1", signedHeaders: [],
+            keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+        )
+        #expect(!signer.isAligned(withFromDomain: "user@example.co.uk"))
+    }
+
+    /// Confirms the already-correct case is unaffected by the fix: `d=`
+    /// one label below a public suffix (a genuine, non-bare Organizational
+    /// Domain) still aligns with a deeper subdomain of itself.
+    @Test func isAlignedIsTrueForARegistrableDomainBelowAPublicSuffixAligningWithItsOwnSubdomain() throws {
+        let signer = try DKIMSigner(
+            domain: "example.co.uk", selector: "s1", signedHeaders: [],
+            keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+        )
+        #expect(signer.isAligned(withFromDomain: "user@anything.example.co.uk"))
     }
 }

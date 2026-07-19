@@ -74,6 +74,16 @@ public struct DKIMSigner: Sendable, MessageSigner {
     let keys: [SigningKey]
     private let now: @Sendable () -> Date
 
+    // FIX #3 (milestone review, security pass): `DKIMSigner` deliberately
+    // does *not* get its own `CustomStringConvertible` override. Swift's
+    // default, reflection-based description for a struct that doesn't
+    // conform recurses into each stored property's own description when
+    // that property's type conforms to `CustomStringConvertible` --
+    // `keys: [SigningKey]` now does (see `SigningKey`'s redacted
+    // `description` in SigningKey.swift), so `"\(dkimSigner)"` already
+    // prints `SigningKey(algorithm: rsa, <redacted>)` for each key element
+    // rather than any key material, with no separate override needed here.
+
     /// Header names that are *always* oversigned by count+1 -- RFC 6376
     /// §5.4/§8.15 semantics, including a count of zero (plan §4.6's
     /// required correction: a header with zero real occurrences still
@@ -131,8 +141,19 @@ public struct DKIMSigner: Sendable, MessageSigner {
                 throw ConfigurationError.rsaKeyTooSmall(bits: privateKey.keySizeInBits)
             }
         }
-        self.domain = domain
-        self.selector = selector
+        // FIX #2 (milestone review, security pass): `domain`/`selector` are
+        // interpolated directly into the `DKIM-Signature` header value
+        // (`sign(_:)` below) with no further sanitization. They're trusted
+        // operator config today, not remotely-attacker-controlled, but if a
+        // future caller sources these from per-tenant/admin-console config
+        // an embedded CR/LF would corrupt the header's own tag syntax --
+        // reusing `HeaderEncoder.rejectHeaderInjection` (the same
+        // fail-loud, uniformly-applied discipline every other
+        // caller-controlled string embedded raw into a header or SMTP
+        // command line already routes through) closes that off at
+        // construction time rather than at the point of use.
+        self.domain = try HeaderEncoder.rejectHeaderInjection(domain, field: "domain")
+        self.selector = try HeaderEncoder.rejectHeaderInjection(selector, field: "selector")
         self.signedHeaders = signedHeaders
         self.canon = canon
         self.keys = keys
@@ -155,6 +176,13 @@ public struct DKIMSigner: Sendable, MessageSigner {
 
         var dkimHeaders: [(name: String, value: String)] = []
         for key in keys {
+            // FIX #4 (milestone review, DKIM/RFC-protocol expert pass):
+            // `q=` and `i=` are both RFC 6376 §3.5 OPTIONAL tags,
+            // deliberately omitted here, not forgotten. `q=` defaults to
+            // `dns/txt`, the only query method ever used in practice --  an
+            // explicit tag would be redundant. `i=` (the Agent or User
+            // Identifier) is essentially unused outside third-party-signer
+            // / ADSP-era configurations this signer doesn't target.
             let tagPrefix = "v=1; a=\(key.algorithm.tagValue); c=\(canon.header.rawValue)/\(canon.body.rawValue); " +
                 "d=\(domain); s=\(selector); t=\(timestamp); h=\(hTagValue); bh=\(bh); b="
             let hashInput = DKIMSigningInput.headerHashInput(
@@ -181,22 +209,61 @@ public struct DKIMSigner: Sendable, MessageSigner {
     /// visible warning, never a thrown error.
     ///
     /// Implements RFC 7489's "relaxed" DMARC alignment mode: `d=` need not
-    /// equal the `From:` domain exactly, only share it as a suffix -- a
-    /// coarse stand-in for "same Organizational Domain." True
+    /// equal the `From:` domain exactly, only share the same Organizational
+    /// Domain -- checked here as a symmetric suffix relationship in either
+    /// direction (`d=` a suffix of the `From:` domain, or vice versa). True
     /// Organizational-Domain determination needs a Public Suffix List,
     /// which this Foundation-only package deliberately does not bundle
-    /// (see the milestone report for this documented limitation): a
-    /// `d=example.co.uk` would be treated as aligning with
-    /// `from=anything.example.co.uk` by this heuristic even where the
-    /// real public suffix boundary is `co.uk`, not `example.co.uk`. For
-    /// the common case (registrable domain used directly as `d=`) this
-    /// heuristic is correct.
+    /// (see the milestone report for this documented limitation). Two real
+    /// caveats follow from that, both confirmed by hand-computation against
+    /// RFC 7489 §3.1.1 and fixed by a milestone review finding:
+    ///
+    /// 1. The relationship must be checked in **both** directions, not just
+    ///    "`from` is a descendant of `d`". A standard ESP/bulk-sender
+    ///    subdomain-signing config -- `d=bounces.example.com` (or
+    ///    `mail.example.com`) signing `From: user@example.com` -- has both
+    ///    domains reducing to the same Organizational Domain
+    ///    (`example.com`) and RFC 7489 says they *should* align, but a
+    ///    one-directional check reports this as misaligned (a false
+    ///    negative on a common, legitimate pattern).
+    /// 2. `d=` must not be permitted to be a bare public suffix. RFC 7489
+    ///    §3.1.1 itself names this case: "a DKIM signature bearing a value
+    ///    of 'd=com' would never allow an 'in alignment' result, as 'com'
+    ///    should appear on all public suffix lists ... and therefore cannot
+    ///    be an Organizational Domain." Without a real PSL, this is guarded
+    ///    with `barePublicSuffixDenylist` below -- a short, explicitly
+    ///    non-exhaustive list of common bare eTLDs/public suffixes, not
+    ///    full PSL compliance. Anything not on that list (e.g. a genuine
+    ///    two-label registrable domain like `example.com`) is still treated
+    ///    as a valid Organizational Domain by this heuristic, matching the
+    ///    documented limitation above: for the common case (registrable
+    ///    domain used directly as `d=`) the heuristic is correct.
     public func isAligned(withFromDomain fromAddress: String) -> Bool {
         guard let fromDomain = Self.domain(fromAddress: fromAddress)?.lowercased() else { return false }
         let d = domain.lowercased()
+        guard !Self.barePublicSuffixDenylist.contains(d) else { return false }
         if d == fromDomain { return true }
-        return fromDomain.hasSuffix("." + d)
+        return fromDomain.hasSuffix("." + d) || d.hasSuffix("." + fromDomain)
     }
+
+    /// Small, explicitly non-exhaustive denylist of known bare public
+    /// suffixes / eTLDs -- enough to catch RFC 7489 §3.1.1's own named
+    /// forbidden case (`d=com`) and its common multi-label cousins
+    /// (`d=co.uk`, etc.) without pulling in a full Public Suffix List
+    /// dependency (a limitation this package already accepts elsewhere --
+    /// see `isAligned`'s doc comment above). Best-effort heuristic, not PSL
+    /// compliance: a public suffix missing from this list will still be
+    /// (incorrectly) treated as a valid Organizational Domain.
+    private static let barePublicSuffixDenylist: Set<String> = [
+        // Common bare gTLDs.
+        "com", "net", "org", "edu", "gov", "mil", "info", "biz", "io",
+        // Common multi-label public suffixes (ccTLD second-level).
+        "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk",
+        "com.au", "net.au", "org.au",
+        "co.jp", "ne.jp", "or.jp",
+        "co.nz", "co.za", "co.in",
+        "com.br", "com.cn", "com.mx",
+    ]
 
     private static func domain(fromAddress address: String) -> String? {
         guard let atIndex = address.lastIndex(of: "@") else { return nil }

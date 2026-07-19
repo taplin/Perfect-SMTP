@@ -375,7 +375,7 @@ These three shapes (single-shot `send`, batch `send`, two-phase compose/sign/sen
 - RFC 2047 correctness including the character-boundary-folding and quoted-string-exclusion corrections (§4.7).
 - Dot-stuffing encoder (leading-dot doubling, terminal `.\r\n`).
 - SASL PLAIN/LOGIN/XOAUTH2 base64 framing against known vectors.
-- **DKIM against RFC 6376 Appendix A test vectors** (known key + message → known `b=`/`bh=`), both RSA and Ed25519 (RFC 8463 vectors), including a test that an oversigned-but-absent header (§4.6) correctly invalidates the signature once that header is later injected.
+- **DKIM against RFC 6376 Appendix A test vectors** (known key + message → known `b=`/`bh=`), both RSA and Ed25519 (RFC 8463 vectors) (RFC 6376 Appendix A's own worked example only reproduces its `c=simple/simple`-labeled `bh=` under relaxed canonicalization -- an independently-confirmed inconsistency in the RFC's own informative appendix, not an implementation bug -- so RFC 8463 Appendix A's internally-consistent republication of the same message is used as the byte-exact reference vector for both algorithms; see `Tests/PerfectSMTPCoreTests/DKIMRealVectorTests.swift`), including a test that an oversigned-but-absent header (§4.6) correctly invalidates the signature once that header is later injected.
 - `ReversePath.null` serializes to exactly `MAIL FROM:<>`.
 - Enhanced-status parser and the 2/3/4/5yz classifier, including `421` classifying separately from `450`/`451`/`452`.
 

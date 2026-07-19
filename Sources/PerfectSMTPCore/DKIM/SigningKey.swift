@@ -86,3 +86,26 @@ public enum SigningKey: Sendable {
         }
     }
 }
+
+// FIX #3 (milestone review, security pass): explicit, redacted
+// `description`/`debugDescription` so an accidental `"\(signingKey)"`
+// interpolation (in a log line, an error message, a crash report) can
+// never leak key material. This is currently safe by accident -- neither
+// `_RSA.Signing.PrivateKey` nor `Curve25519.Signing.PrivateKey` conforms to
+// `CustomStringConvertible` in the pinned swift-crypto version, so Swift's
+// default reflection-based description doesn't print raw key bytes either
+// -- but that safety depends on an upstream dependency's current internals,
+// not a guaranteed local invariant. This override makes the safety
+// explicit and independent of what a future swift-crypto version does.
+extension SigningKey: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String {
+        let algorithmName: String
+        switch self {
+        case .rsa: algorithmName = "rsa"
+        case .ed25519: algorithmName = "ed25519"
+        }
+        return "SigningKey(algorithm: \(algorithmName), <redacted>)"
+    }
+
+    public var debugDescription: String { description }
+}
