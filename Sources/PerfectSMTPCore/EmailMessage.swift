@@ -130,7 +130,11 @@ public enum ContentTransferEncodingOverride: Sendable, Equatable {
     /// applied. `MIMEComposer` validates this against the actual body bytes
     /// at compose time and throws rather than emitting a mislabeled `7bit`
     /// part — RFC 2045 §6.2: "Labelling unencoded data containing 8bit
-    /// characters as '7bit' is not allowed."
+    /// characters as '7bit' is not allowed." The validation applies RFC 2045
+    /// §2.7's full definition of "7bit data", not just the byte-range check:
+    /// no octet >= 0x80, no NUL octet (0x00 — excluded by §2.7 even though
+    /// it's < 0x80), and no line longer than 998 octets between CRLF
+    /// sequences.
     case sevenBit
     /// Applies RFC 2045 §6.7 quoted-printable encoding to the body,
     /// regardless of what `MIMEComposer` would otherwise have chosen. Always
@@ -222,6 +226,29 @@ public struct EmailMessage: Sendable {
     /// header value in `MIMEComposer` goes through — a CRLF here throws
     /// `ComposerError.invalidHeaderValue("bodyContentTypeOverride")` rather
     /// than being silently stripped.
+    ///
+    /// **This override changes only the declared `Content-Type` label —
+    /// never the actual byte transcoding.** There is no character-set
+    /// transcoding engine anywhere in this library: the body's wire bytes
+    /// always come from the Swift `String`'s UTF-8 representation (directly,
+    /// or through `Encoders.quotedPrintable`/`Encoders.base64Wrapped`, both
+    /// of which themselves operate on UTF-8 bytes). Setting e.g.
+    /// `bodyContentTypeOverride = "text/plain; charset=iso-8859-1"` does
+    /// *not* re-encode the body into ISO-8859-1 — it only changes what the
+    /// header *claims*. For an ASCII-only body this is harmless (ASCII is
+    /// byte-identical across charsets), but for a non-ASCII body it would
+    /// silently mislabel UTF-8 bytes as some other charset — the same
+    /// "declared label doesn't match the actual bytes" corruption class the
+    /// transfer-encoding override guards against, just on the charset
+    /// dimension. To catch the misconfiguration at compose time rather than
+    /// let it reach the wire, `MIMEComposer` parses `bodyContentTypeOverride`
+    /// for a `charset=` parameter (a simple, tolerant extraction — not full
+    /// RFC 2045 header-parameter grammar) and, if present and not UTF-8
+    /// (case-insensitive; `utf8` is tolerated as an alias for `utf-8`),
+    /// throws `ComposerError.bodyContentTypeOverrideCharsetMustBeUTF8` rather
+    /// than silently emitting the mismatched claim. An override with no
+    /// `charset=` parameter at all is not required to have one and composes
+    /// normally — only a *present-and-non-UTF-8* charset value is rejected.
     public var bodyContentTypeOverride: String?
     /// Overrides the automatically-computed `Content-Transfer-Encoding` for
     /// the message's primary body part — same single-body-only applicability
@@ -236,8 +263,8 @@ public struct EmailMessage: Sendable {
     /// encoding that could corrupt the message in transit — see
     /// `ContentTransferEncodingOverride`'s doc comment for the full
     /// validation rules and RFC 2045 citations, and
-    /// `ComposerError.sevenBitOverrideRequiresASCIIBody` for the specific
-    /// failure this guards against.
+    /// `ComposerError.sevenBitOverrideRequiresValidSevenBitBody` for the
+    /// specific failure this guards against.
     public var bodyTransferEncodingOverride: ContentTransferEncodingOverride?
     public var inlineImages: [InlineResource]
     public var attachments: [Attachment]

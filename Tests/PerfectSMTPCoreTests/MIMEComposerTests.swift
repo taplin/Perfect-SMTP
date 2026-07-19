@@ -315,16 +315,103 @@ struct MIMEComposerTests {
     }
 
     @Test func bodyContentTypeOverrideIsEmittedVerbatimAsBodyContentType() throws {
+        // Milestone review fix: a non-UTF-8 `charset=` in the override now
+        // throws (see the `bodyContentTypeOverrideCharsetMustBeUTF8...`
+        // tests below), so this "emitted verbatim" test uses a UTF-8
+        // charset -- still exercising verbatim emission of the rest of the
+        // override string (the `text/x-legacy` subtype), just not the
+        // now-rejected non-UTF-8 charset value the original version of this
+        // test used.
         var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
         message.textBody = "hello world"
-        message.bodyContentTypeOverride = "text/x-legacy; charset=iso-8859-1"
+        message.bodyContentTypeOverride = "text/x-legacy; charset=UTF-8"
 
         let composed = try MIMEComposer(message).compose()
 
-        #expect(header(composed, "Content-Type") == "text/x-legacy; charset=iso-8859-1")
+        #expect(header(composed, "Content-Type") == "text/x-legacy; charset=UTF-8")
         // Transfer-encoding is untouched by a content-type-only override --
         // still auto-computed (ASCII body -> 7bit).
         #expect(header(composed, "Content-Transfer-Encoding") == "7bit")
+    }
+
+    // MARK: - bodyContentTypeOverride charset=UTF-8 validation
+    // (milestone review, FIX #1 -- architecture + protocol passes,
+    // independently found: `bodyContentTypeOverride`'s declared charset was
+    // never honored by the actual byte encoding, since this library has no
+    // transcoding engine. See `EmailMessage.bodyContentTypeOverride`'s doc
+    // comment for the full "no-transcoding" invariant this validates.)
+
+    @Test func bodyContentTypeOverrideNonUTF8CharsetThrowsEvenWithASCIIBody() {
+        // ASCII is byte-identical across charsets, so an ASCII body can't
+        // itself reveal a charset mismatch -- this is exactly the
+        // originally-untested gap the milestone review flagged. The
+        // validation fires on the declared charset alone, regardless of
+        // whether the current body content would actually be corrupted by
+        // it.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyContentTypeOverride = "text/plain; charset=iso-8859-1"
+
+        #expect(throws: MIMEComposer.ComposerError.bodyContentTypeOverrideCharsetMustBeUTF8) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyContentTypeOverrideNonUTF8CharsetThrowsWithNonASCIIBody() {
+        // The realistic corruption scenario the review described: a
+        // non-ASCII body whose wire bytes are (as always in this library)
+        // UTF-8, paired with a declared charset that claims otherwise.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "Caf\u{e9}"
+        message.bodyContentTypeOverride = "text/plain; charset=iso-8859-1"
+
+        #expect(throws: MIMEComposer.ComposerError.bodyContentTypeOverrideCharsetMustBeUTF8) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyContentTypeOverrideQuotedNonUTF8CharsetThrows() {
+        // Tolerant parsing also catches the quoted-value form.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyContentTypeOverride = "text/plain; charset=\"windows-1252\""
+
+        #expect(throws: MIMEComposer.ComposerError.bodyContentTypeOverrideCharsetMustBeUTF8) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyContentTypeOverrideUTF8CharsetSucceeds() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "Caf\u{e9}"
+        message.bodyContentTypeOverride = "text/plain; charset=utf-8"
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Type") == "text/plain; charset=utf-8")
+    }
+
+    @Test func bodyContentTypeOverrideUTF8AliasCharsetSucceeds() throws {
+        // "utf8" (no hyphen) is tolerated as a common alias.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "Caf\u{e9}"
+        message.bodyContentTypeOverride = "text/plain; charset=utf8"
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Type") == "text/plain; charset=utf8")
+    }
+
+    @Test func bodyContentTypeOverrideWithNoCharsetParameterSucceeds() throws {
+        // No charset= parameter at all is not an error -- only a
+        // present-and-non-UTF-8 value is rejected.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyContentTypeOverride = "application/x-legacy"
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Type") == "application/x-legacy")
     }
 
     @Test func bodyTransferEncodingOverrideSevenBitWithASCIIBodySucceeds() throws {
@@ -343,9 +430,83 @@ struct MIMEComposerTests {
         message.textBody = "Caf\u{e9}" // contains a byte >= 0x80 in UTF-8
         message.bodyTransferEncodingOverride = .sevenBit
 
-        #expect(throws: MIMEComposer.ComposerError.sevenBitOverrideRequiresASCIIBody) {
+        #expect(throws: MIMEComposer.ComposerError.sevenBitOverrideRequiresValidSevenBitBody) {
             _ = try MIMEComposer(message).compose()
         }
+    }
+
+    // MARK: - .sevenBit validation against RFC 2045 §2.7's full definition
+    // (milestone review, FIX #2 -- protocol pass: the original check only
+    // covered the byte-range half of "7bit data"; NUL octets and overlong
+    // lines were both silently unchecked.)
+
+    @Test func bodyTransferEncodingOverrideSevenBitWithEmbeddedNULThrows() {
+        // RFC 2045 §2.7: "No octets with decimal values greater than 127
+        // are allowed and neither are NULs (octets with decimal value 0)."
+        // A NUL byte is < 0x80, so the original (byte-range-only) check
+        // passed this straight through as "7bit" -- the exact gap this fix
+        // closes.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello\u{0}world"
+        message.bodyTransferEncodingOverride = .sevenBit
+
+        #expect(throws: MIMEComposer.ComposerError.sevenBitOverrideRequiresValidSevenBitBody) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyTransferEncodingOverrideSevenBitWithLineOver998OctetsThrows() {
+        // RFC 2045 §2.7: "short lines with 998 octets or less between CRLF
+        // line separation sequences." One line of 999 'a's, with a short
+        // line on either side so only the middle line is actually overlong.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        let overlongLine = String(repeating: "a", count: 999)
+        message.textBody = "first\n\(overlongLine)\nlast"
+        message.bodyTransferEncodingOverride = .sevenBit
+
+        #expect(throws: MIMEComposer.ComposerError.sevenBitOverrideRequiresValidSevenBitBody) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyTransferEncodingOverrideSevenBitWithLineOf998OctetsSucceeds() throws {
+        // Exactly 998 octets is the boundary RFC 2045 §2.7 allows ("998
+        // octets or less") -- must not throw.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        let boundaryLine = String(repeating: "a", count: 998)
+        message.textBody = boundaryLine
+        message.bodyTransferEncodingOverride = .sevenBit
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "7bit")
+    }
+
+    @Test func defaultAutoDetectionFallsBackToQuotedPrintableForASCIIBodyWithEmbeddedNUL() throws {
+        // Milestone review: the same NUL gap existed (pre-existing, not new
+        // to this feature) in the default auto-detection path (no
+        // override) -- fixed identically for consistency. An all-ASCII body
+        // containing a NUL is no longer mislabeled `7bit`; it now falls
+        // through to the same quoted-printable path a non-ASCII body uses.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello\u{0}world"
+        // bodyTransferEncodingOverride left nil -- exercising auto-detection.
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "quoted-printable")
+        #expect(String(decoding: composed.body, as: UTF8.self) == Encoders.quotedPrintable("hello\u{0}world"))
+    }
+
+    @Test func defaultAutoDetectionFallsBackToQuotedPrintableForASCIIBodyWithOverlongLine() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        let overlongLine = String(repeating: "a", count: 999)
+        message.textBody = overlongLine
+        // bodyTransferEncodingOverride left nil -- exercising auto-detection.
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "quoted-printable")
     }
 
     @Test func bodyTransferEncodingOverrideQuotedPrintableActuallyEncodesASCIIBody() throws {

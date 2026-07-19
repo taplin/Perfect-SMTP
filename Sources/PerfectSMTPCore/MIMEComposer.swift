@@ -94,13 +94,36 @@ public struct MIMEComposer: Sendable {
         case bodyOverrideRequiresSingleBodyPart
         /// `bodyTransferEncodingOverride == .sevenBit` but the body (the
         /// single `textBody` xor `htmlBody` leaf the override applies to)
-        /// contains a byte >= 0x80 — RFC 2045 §6.2: "Labelling unencoded
-        /// data containing 8bit characters as '7bit' is not allowed." Fails
-        /// loud rather than emitting a mislabeled `7bit` part: an
-        /// intermediate relay that trusts the `7bit` label and strips the
-        /// 8th bit on the (actually non-ASCII) body would silently corrupt
-        /// the message in transit.
-        case sevenBitOverrideRequiresASCIIBody
+        /// does not satisfy RFC 2045 §2.7's full definition of "7bit data"
+        /// — a byte >= 0x80, an embedded NUL octet (0x00; excluded by §2.7
+        /// even though it's < 0x80), or a line longer than 998 octets
+        /// between CRLF sequences. Named more broadly than the original
+        /// `...RequiresASCIIBody` (milestone review, protocol pass: the
+        /// original name/check covered only the byte-range half of §2.7's
+        /// definition) since all three conditions are the same class of
+        /// mistake — RFC 2045 §6.2: "Labelling unencoded data containing
+        /// 8bit characters as '7bit' is not allowed," and by the same logic,
+        /// data that isn't valid 7bit data at all for any of §2.7's three
+        /// reasons. Fails loud rather than emitting a mislabeled `7bit`
+        /// part: an intermediate relay that trusts the `7bit` label would
+        /// silently corrupt or misinterpret the message in transit.
+        case sevenBitOverrideRequiresValidSevenBitBody
+        /// `EmailMessage.bodyContentTypeOverride` carried a `charset=`
+        /// parameter whose value was present but not UTF-8 (case-
+        /// insensitive; `utf8` tolerated as an alias for `utf-8`).
+        /// Milestone review finding (architecture + protocol passes,
+        /// independently): this library has no transcoding engine anywhere
+        /// — body bytes are always the Swift `String`'s UTF-8
+        /// representation (see `bodyContentTypeOverride`'s doc comment for
+        /// the full "no-transcoding" invariant) — so honoring a non-UTF-8
+        /// `charset=` claim in the override would emit a `Content-Type`
+        /// header describing bytes that were never actually produced,
+        /// silently corrupting any non-ASCII body at the receiving end.
+        /// Fails loud rather than emitting the mismatched claim, matching
+        /// this composer's established caller-misconfiguration precedent.
+        /// An override with no `charset=` parameter at all does not throw
+        /// — this only fires when a charset is present and wrong.
+        case bodyContentTypeOverrideCharsetMustBeUTF8
     }
 
     /// Case-insensitive denylist of header names `extraHeaders` may never
@@ -448,11 +471,20 @@ public struct MIMEComposer: Sendable {
     /// applying the override here unconditionally (no further "is this the
     /// right part" check needed) is safe.
     private func textLeaf(_ text: String, subtype: String) throws -> MIMEPart {
-        let isASCII = text.utf8.allSatisfy { $0 < 0x80 }
+        // Computed once and reused by every branch below: this is also the
+        // exact byte sequence that gets sent on the wire whenever the body
+        // isn't further transformed (7bit/nil paths), so RFC 2045 §2.7
+        // "7bit data" validation runs against these bytes, not the raw
+        // (possibly bare-CR/LF) `text` — normalizeLineEndings already
+        // guarantees CR/LF only ever appear here as CRLF pairs, so "octets
+        // between CRLF sequences" (§2.7's line definition) reduces to
+        // counting octets between the CRLF pairs actually present.
+        let normalizedBytes = Array(normalizeLineEndings(text).utf8)
 
         let contentType: String
         if let override = message.bodyContentTypeOverride {
             try Self.requireNoInjection(override, field: "bodyContentTypeOverride")
+            try Self.requireUTF8CharsetIfPresent(override)
             contentType = override
         } else {
             contentType = "text/\(subtype); charset=\(charset)"
@@ -463,14 +495,19 @@ public struct MIMEComposer: Sendable {
         switch message.bodyTransferEncodingOverride {
         case .sevenBit:
             // RFC 2045 §6.2: "Labelling unencoded data containing 8bit
-            // characters as '7bit' is not allowed." Validated against the
-            // actual bytes, not just trusted, since a caller-supplied label
-            // that doesn't match the real content is exactly the
+            // characters as '7bit' is not allowed," and more generally RFC
+            // 2045 §2.7's full definition of "7bit data" (no byte >= 0x80,
+            // no NUL octet, no line > 998 octets between CRLF sequences —
+            // see `isValidSevenBitData`). Validated against the actual
+            // bytes, not just trusted, since a caller-supplied label that
+            // doesn't match the real content is exactly the
             // transit-corruption risk this override exists to avoid
             // reopening.
-            guard isASCII else { throw ComposerError.sevenBitOverrideRequiresASCIIBody }
+            guard Self.isValidSevenBitData(normalizedBytes) else {
+                throw ComposerError.sevenBitOverrideRequiresValidSevenBitBody
+            }
             cte = "7bit"
-            bodyBytes = Array(normalizeLineEndings(text).utf8)
+            bodyBytes = normalizedBytes
         case .quotedPrintable:
             // Always representable regardless of body content — genuinely
             // applies RFC 2045 §6.7 encoding to the bytes (not just a header
@@ -486,13 +523,25 @@ public struct MIMEComposer: Sendable {
             // (RFC 2045's canonical form for text media) before being
             // base64-encoded, matching the 7bit/quoted-printable paths.
             cte = "base64"
-            bodyBytes = Array(Encoders.base64Wrapped(Data(normalizeLineEndings(text).utf8)).utf8)
+            bodyBytes = Array(Encoders.base64Wrapped(Data(normalizedBytes)).utf8)
         case nil:
-            // No override — original auto-computed behavior, byte-for-byte
-            // unchanged from before this feature existed.
-            if isASCII {
+            // No override — auto-computed behavior. Milestone review
+            // (protocol pass): this path had the same pre-existing gap the
+            // `.sevenBit` override path had before this fix — it checked
+            // only the byte-range half of RFC 2045 §2.7's "7bit data"
+            // definition, so a body that was all-ASCII but contained a NUL
+            // octet or an overlong line was mislabeled `7bit` here too.
+            // Fixed identically to the override path above, for consistency
+            // (see `isValidSevenBitData`) — a body that fails the full
+            // §2.7 check now falls through to the same quoted-printable
+            // path a non-ASCII body already used, rather than being
+            // mislabeled. This is a strict improvement over the prior
+            // default behavior, not a new risk: nothing that used to
+            // qualify as valid 7bit data stops qualifying, so no
+            // conforming existing caller is affected.
+            if Self.isValidSevenBitData(normalizedBytes) {
                 cte = "7bit"
-                bodyBytes = Array(normalizeLineEndings(text).utf8)
+                bodyBytes = normalizedBytes
             } else {
                 cte = "quoted-printable"
                 bodyBytes = Array(Encoders.quotedPrintable(text).utf8)
@@ -506,6 +555,65 @@ public struct MIMEComposer: Sendable {
             ],
             body: .leaf(bodyBytes)
         )
+    }
+
+    /// RFC 2045 §2.7's full definition of "7bit data": "data that is all
+    /// represented as relatively short lines with 998 octets or less
+    /// between CRLF line separation sequences. No octets with decimal
+    /// values greater than 127 are allowed and neither are NULs (octets
+    /// with decimal value 0)." (CR/LF occurring only as part of a CRLF pair
+    /// is guaranteed upstream by `normalizeLineEndings`, so that third
+    /// sub-condition doesn't need a separate check here.) `bytes` is assumed
+    /// to already be CRLF-normalized (i.e. the output of
+    /// `normalizeLineEndings(_:).utf8`), matching every call site.
+    private static func isValidSevenBitData(_ bytes: [UInt8]) -> Bool {
+        guard bytes.allSatisfy({ $0 < 0x80 && $0 != 0x00 }) else { return false }
+        var lineLength = 0
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == 0x0D, index + 1 < bytes.count, bytes[index + 1] == 0x0A {
+                lineLength = 0
+                index += 2
+                continue
+            }
+            lineLength += 1
+            if lineLength > 998 { return false }
+            index += 1
+        }
+        return true
+    }
+
+    /// FIX #1 (milestone review, architecture + protocol passes): tolerant
+    /// extraction of a `charset=` parameter's value from a caller-supplied
+    /// `Content-Type`-shaped string, and rejection if present-and-not-UTF-8.
+    /// Deliberately not a full RFC 2045 header-parameter parser — just a
+    /// `;`-split, case-insensitive-on-the-parameter-name, quote-tolerant
+    /// extraction of `charset=VALUE` / `charset="VALUE"`, sufficient to
+    /// catch the mismatched-label class of bug this guards against without
+    /// implementing a general MIME header grammar for a single field. A
+    /// missing `charset=` parameter is not an error — this only rejects a
+    /// charset that is present and resolves to something other than UTF-8.
+    private static func requireUTF8CharsetIfPresent(_ contentTypeOverride: String) throws {
+        guard let charsetValue = extractCharsetParameter(from: contentTypeOverride) else { return }
+        let normalized = charsetValue.lowercased()
+        guard normalized == "utf-8" || normalized == "utf8" else {
+            throw ComposerError.bodyContentTypeOverrideCharsetMustBeUTF8
+        }
+    }
+
+    private static func extractCharsetParameter(from contentType: String) -> String? {
+        for rawParam in contentType.split(separator: ";") {
+            let param = rawParam.trimmingCharacters(in: .whitespaces)
+            guard let equalsIndex = param.firstIndex(of: "=") else { continue }
+            let name = param[param.startIndex..<equalsIndex].trimmingCharacters(in: .whitespaces)
+            guard name.lowercased() == "charset" else { continue }
+            var value = param[param.index(after: equalsIndex)...].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            return value
+        }
+        return nil
     }
 
     private func attachmentLeaf(_ attachment: Attachment) throws -> MIMEPart {
