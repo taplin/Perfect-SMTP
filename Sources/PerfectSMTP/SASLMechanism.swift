@@ -12,10 +12,41 @@
 
 import Foundation
 
+/// A SASL mechanism's message-exchange state machine, driven by
+/// `SMTPConnection.authenticate(_:)` during `AUTH`. Implement this to add a
+/// mechanism beyond the three built-in ones (`SASLPlain`/`SASLLogin`/
+/// `XOAuth2`); `SMTPConnection` calls these methods in a fixed order and
+/// doesn't need to know which concrete mechanism it's driving.
+///
+/// Exchange shape: `initialResponse()` is called exactly once, before the
+/// first `AUTH <name>` command is even sent -- returning non-`nil` sends it
+/// as the (optional, RFC 4954) inline initial-response argument on that same
+/// command line; returning `nil` (as `SASLLogin` does) sends a bare
+/// `AUTH <name>` with no inline argument, and the server's first `334`
+/// challenge is handled by `respond(to:)` instead. After that,
+/// `SMTPConnection.authenticate(_:)`'s exchange loop calls `respond(to:)`
+/// once per `334` continuation reply the server sends, purely driven by the
+/// server's own reply codes -- it stops once the server issues a final,
+/// non-`334` reply (`235` success or a `5xx`/`4xx` failure), not by
+/// consulting `isComplete`.
 public protocol SASLMechanism: Sendable {
+    /// The `AUTH` command's mechanism name (e.g. `"PLAIN"`, `"LOGIN"`,
+    /// `"XOAUTH2"`), sent verbatim as `AUTH <name>`.
     var name: String { get }
+    /// The RFC 4954 inline initial response, sent base64-encoded on the same
+    /// line as `AUTH <name>` when non-`nil`. Return `nil` for a mechanism
+    /// that has nothing to say before seeing the server's first challenge
+    /// (e.g. `SASLLogin`).
     mutating func initialResponse() async throws -> [UInt8]?
+    /// Computes this mechanism's response to one base64-decoded `334`
+    /// challenge from the server. May be `async`-suspending (`XOAuth2` uses
+    /// this to `await` its `tokenProvider` closure).
     mutating func respond(to challenge: [UInt8]) async throws -> [UInt8]
+    /// Whether this mechanism considers its own step sequence finished.
+    /// Exposed for the mechanism's own bookkeeping/introspection --
+    /// `SMTPConnection.authenticate(_:)`'s exchange loop does not currently
+    /// consult this property itself; it terminates purely on the server's
+    /// reply code (see this protocol's own doc comment).
     var isComplete: Bool { get }
 }
 

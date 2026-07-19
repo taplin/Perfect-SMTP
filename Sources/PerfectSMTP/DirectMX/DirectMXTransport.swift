@@ -324,6 +324,16 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         )
     }
 
+    /// Resolves and delivers directly to `envelope.recipients`' own MX
+    /// hosts, per-domain (see `deliverToDomain`'s doc comment for the full
+    /// host-fallback/TLS-policy/MTA-STS decision tree). Unlike
+    /// `RelayTransport`/`LocalMTATransport`, a `.queuedForRetry` result from
+    /// this call is automatically enqueued onto this transport's own
+    /// `DirectMXRetryQueue` and redelivered in the background (see
+    /// `enqueueRetries(from:mailFrom:message:)`) -- callers don't need to
+    /// re-invoke `send` themselves to get retry behavior. This method
+    /// itself never throws; every failure mode (DNS, connection, SMTP-level
+    /// rejection) is represented as a per-recipient `DeliveryResult`.
     public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
         let results = await Self.performDelivery(
             envelope: envelope, message: message, resolver: resolver, pool: pool,
@@ -334,6 +344,12 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         return results
     }
 
+    /// Stops this transport's background retry queue (abandoning any
+    /// still-pending scheduled redeliveries -- see `pendingRetryEntries()`
+    /// to inspect what those are before calling this) and closes every
+    /// pooled connection to every destination host this transport has
+    /// dialed. Does not close the `EventLoopGroup` this transport was
+    /// constructed with.
     public func shutdown() async {
         await retryQueue.shutdown()
         await pool.shutdown()

@@ -175,6 +175,45 @@ public struct EmailMessage: Sendable {
     public var charset: String
     public var defaultDisposition: ContentDisposition
 
+    /// Only `from` is required -- everything else defaults to "absent" (an
+    /// empty recipient list, no body) and is intended to be set afterward
+    /// via `var message = EmailMessage(from: ...); message.to = [...]`,
+    /// matching the pattern this library's own tests and the user guide's
+    /// examples use throughout, rather than a single large initializer
+    /// call. `MIMEComposer.compose()` (not this initializer) is what
+    /// actually validates the result -- e.g. it throws if both `textBody`
+    /// and `htmlBody` are nil, since a message needs at least one -- so
+    /// constructing an otherwise-incomplete `EmailMessage` here is not
+    /// itself an error.
+    ///
+    /// - Parameters:
+    ///   - from: The `From:` header. Always required; there is no default
+    ///     recipient-less sender identity.
+    ///   - sender: A distinct `Sender:` header (RFC 5322 §3.6.2) --
+    ///     set this only when the message is being sent on `from`'s behalf
+    ///     by a different actual sender (e.g. an assistant sending for a
+    ///     manager). Leave `nil` for the ordinary case where `from` and the
+    ///     actual sender are the same mailbox.
+    ///   - to/cc: Recipients that appear in the corresponding headers *and*
+    ///     become part of the SMTP envelope's `RCPT TO` list when this
+    ///     message is passed to `SMTPMailer.send`. There is deliberately no
+    ///     `bcc` parameter here -- Bcc addresses are supplied separately,
+    ///     as extra envelope recipients that never appear in any header
+    ///     sent to any recipient. See `SMTPMailer.send(_:bcc:envelopeFrom:)`.
+    ///   - date/messageID: Leave `nil` to have `MIMEComposer` auto-
+    ///     synthesize both at composition time (a real wall-clock `Date:`
+    ///     header, and a `Message-ID` scoped to the sending domain) --
+    ///     most callers should leave these unset rather than generating
+    ///     their own.
+    ///   - extraHeaders: Caller-supplied additional headers, checked at
+    ///     composition time against `MIMEComposer.forbiddenExtraHeaderNames`
+    ///     (`Bcc`, `To`, `From`, `Message-ID`, `DKIM-Signature`, and other
+    ///     headers this library already manages) -- an attempt to smuggle
+    ///     one of those back in here throws `ComposerError.forbiddenHeader`
+    ///     rather than being silently overwritten or accepted.
+    ///   - defaultDisposition: Applied to every `Attachment` that doesn't
+    ///     set its own `disposition`; has no effect on `inlineImages`,
+    ///     which are always `Content-Disposition: inline` by construction.
     public init(
         from: EmailAddress,
         sender: EmailAddress? = nil,

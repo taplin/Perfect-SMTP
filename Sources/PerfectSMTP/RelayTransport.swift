@@ -65,6 +65,13 @@ public final class RelayTransport: SMTPTransport, Sendable {
     private let pool: SMTPConnectionPool
     private let key: SMTPConnectionPool.Key
 
+    /// - Parameters:
+    ///   - config: The relay host/port/TLS/auth to send through. Every
+    ///     `send(_:_:)` call on this transport goes to this one configured
+    ///     destination.
+    ///   - group: The `EventLoopGroup` this transport's connection pool and
+    ///     every connection it dials run on. Not owned by this transport --
+    ///     the caller is responsible for its lifecycle.
     public init(config: RelayConfig, group: any EventLoopGroup) {
         self.config = config
         self.pool = SMTPConnectionPool(configuration: config.pool, ehloHostname: config.ehloHostname, group: group)
@@ -82,6 +89,15 @@ public final class RelayTransport: SMTPTransport, Sendable {
         self.key = SMTPConnectionPool.Key(host: config.host, port: config.port, tls: config.tls)
     }
 
+    /// Checks out a pooled connection to `config.host`, authenticating it
+    /// first if it's freshly dialed and `config.auth` isn't `.none`, then
+    /// runs one mail transaction against it. `RelayTransport` never
+    /// auto-retries a transient failure itself -- a `.queuedForRetry`
+    /// `DeliveryResult` reflects the server's own reply classification, but
+    /// nothing here schedules a redelivery attempt (unlike
+    /// `DirectMXTransport`, which owns a retry queue); see
+    /// `Documentation/user-guide.md`'s "Handling delivery results and
+    /// retries" section for what that means for callers.
     public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
         // FIX (milestone architecture + SMTP-protocol reviews, originally
         // flagged against `DirectMXTransport.attemptOnHost` but confirmed
@@ -109,6 +125,10 @@ public final class RelayTransport: SMTPTransport, Sendable {
         }
     }
 
+    /// Closes every pooled connection to `config.host`. Call this when
+    /// you're done sending through this transport -- it does not close the
+    /// `EventLoopGroup` it was constructed with, only the connections this
+    /// transport itself opened.
     public func shutdown() async {
         await pool.shutdown()
     }

@@ -1,12 +1,3 @@
-> **TODO (post-Phase-0 doc pass):** This README describes the pre-rewrite,
-> libcurl-based `EMail`/`SMTPClient`/`Recipient` API, which no longer
-> exists as of the Swift 6.2/SwiftNIO rewrite
-> (`Documentation/swift6-nio-rewrite-plan.md`). Phase 0 replaced it with
-> `PerfectSMTPCore`'s `EmailMessage`/`EmailAddress`/`SMTPEnvelope`/
-> `MIMEComposer` types; Phase 1 adds the actual sending API
-> (`SMTPMailer`). A full documentation rewrite is a separate future task —
-> this note is a placeholder so the gap is visible, not silently stale.
-
 # Perfect - SMTP [简体中文](README.zh_CN.md)
 
 <p align="center">
@@ -18,184 +9,164 @@
 <p align="center">
     <a href="https://github.com/PerfectlySoft/Perfect" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_1_Star.jpg" alt="Star Perfect On Github" />
-    </a>  
+    </a>
     <a href="http://stackoverflow.com/questions/tagged/perfect" target="_blank">
         <img src="http://www.perfect.org/github/perfect_gh_button_2_SO.jpg" alt="Stack Overflow" />
-    </a>  
+    </a>
     <a href="https://twitter.com/perfectlysoft" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_3_twit.jpg" alt="Follow Perfect on Twitter" />
-    </a>  
+    </a>
     <a href="http://perfect.ly" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_4_slack.jpg" alt="Join the Perfect Slack" />
     </a>
 </p>
 
 <p align="center">
-    <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-4.1-orange.svg?style=flat" alt="Swift 4.1">
+    <a href="https://www.swift.org/" target="_blank">
+        <img src="https://img.shields.io/badge/Swift-6.2-orange.svg?style=flat" alt="Swift 6.2">
     </a>
-    <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Platforms-OS%20X%20%7C%20Linux%20-lightgray.svg?style=flat" alt="Platforms OS X | Linux">
+    <a href="https://developer.apple.com/macos/" target="_blank">
+        <img src="https://img.shields.io/badge/Platforms-macOS%2026%2B-lightgray.svg?style=flat" alt="Platforms macOS 26+">
     </a>
-    <a href="http://perfect.org/licensing.html" target="_blank">
-        <img src="https://img.shields.io/badge/License-Apache-lightgrey.svg?style=flat" alt="License Apache">
+    <a href="LICENSE" target="_blank">
+        <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg?style=flat" alt="License Apache 2.0">
     </a>
     <a href="http://twitter.com/PerfectlySoft" target="_blank">
         <img src="https://img.shields.io/badge/Twitter-@PerfectlySoft-blue.svg?style=flat" alt="PerfectlySoft Twitter">
     </a>
-    <a href="http://perfect.ly" target="_blank">
-        <img src="http://perfect.ly/badge.svg" alt="Slack Status">
-    </a>
 </p>
 
+Perfect-SMTP is a from-scratch Swift 6.2 / SwiftNIO SMTP client. It is not a
+wrapper around libcurl or any other mail library — it drives the SMTP wire
+protocol itself, including its own STARTTLS state machine, connection
+pooling, DKIM signing, and MTA-STS policy enforcement.
 
+It ships three delivery strategies (relay through an existing SMTP host,
+hand off to a local MTA like Postfix/sendmail, or resolve MX records and
+deliver directly), so you can pick the one that matches how you already
+operate mail, or let Perfect-SMTP be the terminal MTA itself.
 
-This project provides an SMTP library.
+> This is a complete rewrite of the pre-2026 libcurl-based Perfect-SMTP. If
+> you used the old `EMail`/`SMTPClient`/`Recipient` API, see
+> [Migrating from the old Perfect-SMTP](Documentation/user-guide.md#migrating-from-the-old-perfect-smtp)
+> in the user guide — this is not a drop-in upgrade.
 
-This package builds with Swift Package Manager and is part of the [Perfect](https://github.com/PerfectlySoft/Perfect) project.
+## Features
 
-Ensure you have installed and activated the latest Swift 4.1.1 tool chain.
+- **Hand-rolled SMTP client on SwiftNIO** — its own STARTTLS upgrade
+  sequence with byte-precise buffer discipline against injection/downgrade
+  attacks, connection pooling with circuit breaking, and PIPELINING support.
+- **DKIM signing** (RFC 6376) — RSA-SHA256 and Ed25519-SHA256 (RFC 8463),
+  including dual-signing, with automatic oversigning of security-sensitive
+  headers and a DMARC-alignment lint.
+- **Three delivery strategies** — `RelayTransport` (an ESP or existing SMTP
+  relay), `LocalMTATransport` (hand off to `sendmail`/Postfix on the same
+  host), and `DirectMXTransport` (resolve MX records and deliver directly,
+  with its own retry queue and circuit breaker).
+- **MTA-STS** (RFC 8461) policy discovery, caching, and enforcement for
+  direct-MX delivery, plus opportunistic STARTTLS by default.
+- **SASL authentication** — `PLAIN`, `LOGIN`, and `XOAUTH2` (required by
+  Gmail/Workspace, increasingly required by Microsoft 365).
+- **Deliverability headers** — `List-Unsubscribe`/`List-Unsubscribe-Post`
+  (RFC 8058), `Precedence`, `Auto-Submitted` — the headers Gmail and Yahoo
+  have required for bulk senders since November 2025.
+- **Bulk/list-server ready** — a bounded-concurrency batch `send` and an
+  `AsyncSequence`-based streaming `send` for sending to millions of
+  recipients without materializing them all in memory.
+- **Structured delivery results** — every send returns a per-recipient
+  outcome (delivered, queued for retry, permanently failed, expired,
+  ambiguous, or a transport-level failure) instead of a single pass/fail.
 
-## Linux Build Note
+For anything beyond the basics below, see the
+**[full user guide](Documentation/user-guide.md)**.
 
-Please make sure libssl-dev was installed on Ubuntu 16.04:
+## Requirements
 
+- Swift 6.2 toolchain (`swift-tools-version: 6.2`, `.swiftLanguageMode(.v6)`)
+- macOS 26 or later (`Package.swift` declares `platforms: [.macOS(.v26)]`)
+
+## Installation
+
+Add the package to your `Package.swift`:
+
+```swift
+.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "6.0.0")
 ```
-$ sudo apt-get install libssl-dev
+
+and depend on the `PerfectSMTP` product (it re-exports `PerfectSMTPCore`,
+which you only need directly if you want to compose/sign messages without
+sending them):
+
+```swift
+.target(
+    name: "YourTarget",
+    dependencies: [
+        .product(name: "PerfectSMTP", package: "Perfect-SMTP"),
+    ]
+)
 ```
 
-## The Best Practice
+## Quick start
 
-Prior to code with Perfect-SMTP, please feel free to try [SMTP command line example by curl](https://ec.haxx.se/usingcurl-smtp.html).
+Send one email through an existing SMTP relay (a corporate MTA or an ESP
+like SendGrid/Postmark/SES):
 
-This command line tool can be helpful to understand the SMTP protocol and the objective server you are going to work with.
-
-
-## Quick Start
-
-To use SMTP class, please modify the Package.swift file and add following dependency:
-
-``` swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "3.0.0")
-```
-
-Then please import SMTP library into the swift source code:
-
-``` swift
+```swift
 import PerfectSMTP
-```
+import NIOPosix
 
-## Data Structures
+let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
-Perfect SMTP contains three different data structures: SMTPClient, Recipient and EMail.
+let transport = RelayTransport(
+    config: RelayConfig(
+        host: "smtp.example.com",
+        port: 587,
+        tls: .startTLS,
+        auth: .plain(username: "postmaster@example.com", password: "secret")
+    ),
+    group: group
+)
+let mailer = SMTPMailer(transport: transport)
 
-### SMTPClient
+var message = EmailMessage(from: EmailAddress(displayName: "Ops", address: "ops@example.com"))
+message.to = [EmailAddress(address: "user@dest.com")]
+message.subject = "Hello from Perfect-SMTP"
+message.textBody = "Hi there!"
 
-SMTPClient object is a data structure to store mail server login information:
-
-``` swift
-let client = SMTPClient(url: "smtp://mailserver.address", username: "someone@some.where", password:"secret")
-```
-
-### Recipient
-
-Recipient object is a data structure which store one's name and email address:
-
-``` swift
-let recipient = Recipient(name: "Someone's Full Name", address: "someone@some.where")
-```
-
-### EMail
-
-Using email object to compose and send an email. Check the following example code:
-
-``` swift
-// initialize an email draft with mail connection / login info
-var email = EMail(client: client)
-
-// set the title of email
-email.subject = "Mail Title"
-
-// set the sender info
-email.from = Recipient(name: "My Full Name", address: "mynickname@my.home")
-
-// fill in the main content of email, plain text or html
-email.html = "<h1>Hello, world!</h1><hr><img src='http://www.perfect.org/images/perfect-logo-2-0.svg'>"
-
-// set the mail recipients, to / cc / bcc are all arrays
-email.to.append(Recipient(name: "First Receiver", address: "someone@some.where"))
-email.cc.append(Recipient(name: "Second Receiver", address: "someOtherOne@some.where"))
-email.bcc.append(Recipient(name: "An invisible receiver", address: "someoneElse@some.where"))
-
-// add attachments
-email.attachments.append("/path/to/file.txt")
-email.attachments.append("/path/to/img.jpg")
-
-// send the email and call back if done.
-do {
-  try email.send { code, header, body in
-    /// response info from mail server
-    print(code)
-    print(header)
-    print(body)
-  }//end send
-}catch(let err) {
-  /// something wrong
+let results = try await mailer.send(message, envelopeFrom: .address("ops@example.com"))
+for result in results {
+    print(result.recipient, result.outcome)
 }
+
+try await group.shutdownGracefully()
 ```
 
-#### Members of EMail Object
+That's it for the basic case. For DKIM signing, direct-MX delivery,
+authentication options, bulk sending, and deliverability headers, see the
+**[user guide](Documentation/user-guide.md)**.
 
-- client: SMTPClient, login info for mail server connection
-- to: [Recipient], array of mail recipients
-- cc: [Recipient], array of mail recipients, "copy / forward"
-- bcc:[Recipient], array of mail recipients, will not appear in the to / cc mail.
-- from: Recipient, email address of the current sender
-- subject: String, title of the email
-- attachments: [String], full path of attachments, i.e., ["/path/to/file1.txt", "/path/to/file2.gif" ...]
-- content: String, mail body in text, plain text or html
-- html: String, alias of `content` (share the same variable as `content`)
-- text: String, set the content to plain text
-- send(completion: @escaping ((Int, String, String)->Void)), function of sending email with callback.
-The completion callback has three parameters, please check Perfect-CURL `performFully()` for more information:
-  - code: Int, mail server response code. Zero for OK.
-  - header: String, mail server response header string.
-  - body: String, mail server response body string.
+## Testing
 
-
-## Example
-
-A demo can be found here:
-[Perfect SMTP Demo](https://github.com/PerfectExamples/Perfect-SMTP-Demo)
-
-## Tips for SMTPS
-
-We've received a lot of requests about google smtp examples, Thanks for @ucotta @james and of course the official Perfect support from @iamjono, this note might be helpful for building gmail applications: ⚠️*the SMTPClient url needs to be `smtps://smtp.gmail.com`, and you may need to [“turn on access for less secure apps”](https://myaccount.google.com/lesssecureapps) in the google settings.*⚠️
-
-Please check the SMTPS code below, note the only difference is the URL pattern:
-
-``` swift
-import PerfectSMTP
-
-let client = SMTPClient(url: "smtps://smtp.gmail.com", username: "yourname@gmail.com", password:"yourpassword")
-
-var email = EMail(client: client)
-
-email.subject = "a topic"
-email.content = "a message"
-
-email.cc.append(Recipient(address: "who@where.com"))
-
-do {
-  try email.send { code, header, body in
-    /// response info from mail server
-    print(code)
-  }//end send
-}catch(let err) {
-  /// something wrong
-}
+```
+swift test
 ```
 
+All 323 tests run with no external services and no environment variables —
+this includes tests that open real loopback sockets (a STARTTLS handshake
+and a full DirectMX delivery each run against an in-process fake SMTP
+server on `127.0.0.1`), but nothing here talks to the real network or a
+real mail server.
 
-## Further Information
-For more information on the Perfect project, please visit [perfect.org](http://perfect.org).
+Note: the original rewrite plan (`Documentation/swift6-nio-rewrite-plan.md`
+§4.1/§5) describes an additional `SMTP_TESTS=1`-gated live-integration tier
+against a MailHog/smtp4dev CI service container. That tier was never built —
+there is no such environment variable referenced anywhere in `Tests/`, and
+this repository has no CI workflow files at all. If you need to verify
+against a real SMTP server, point a `RelayTransport` or `DirectMXTransport`
+at a local MailHog/smtp4dev instance yourself; see
+[Testing your integration](Documentation/user-guide.md#testing-your-integration)
+in the user guide.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

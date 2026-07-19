@@ -40,6 +40,25 @@ public struct SMTPMailer: Sendable {
     /// emits a log line, kept intentionally narrow in scope.
     private let logger: Logger
 
+    /// - Parameters:
+    ///   - transport: The delivery strategy this mailer sends through --
+    ///     `RelayTransport`, `LocalMTATransport`, `DirectMXTransport`, or
+    ///     any other `SMTPTransport` conformance. Every `send` overload on
+    ///     this mailer ultimately calls `transport.send(_:_:)` once per
+    ///     message.
+    ///   - signer: `nil` (the default) means no DKIM step at all -- the
+    ///     composed message is sent unsigned. Pass a `DKIMSigner` (see
+    ///     `PerfectSMTPCore/DKIM/DKIMSigner.swift`) to sign every message
+    ///     this mailer sends; see `composeAndSign(_:)` for exactly where
+    ///     signing happens in the pipeline.
+    ///   - configuration: Currently just `maxInFlightBatchSends`, the
+    ///     concurrency cap for the batch/streaming `send` overloads below
+    ///     -- irrelevant to the single-message `send(_:bcc:envelopeFrom:)`.
+    ///   - logger: Used only to log a warning when `signer` is a
+    ///     `DKIMSigner` whose `d=` domain doesn't DMARC-align with the
+    ///     message's `From:` domain (see `composeAndSign(_:)`) -- this
+    ///     mailer never logs anything else. Defaults to a logger labeled
+    ///     `"PerfectSMTP.SMTPMailer"`.
     public init(
         transport: any SMTPTransport,
         signer: (any MessageSigner)? = nil,

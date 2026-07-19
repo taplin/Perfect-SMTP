@@ -66,6 +66,17 @@ public actor LocalMTATransport: SMTPTransport {
         self.config = config
     }
 
+    /// Hands `message` to the configured local MTA binary via `Process`,
+    /// passing `envelope.recipients` (which already includes any Bcc
+    /// addresses) as explicit trailing arguments. A `.delivered` result
+    /// here means only "the local MTA's process exited zero and accepted
+    /// the handoff" -- actual delivery to each recipient's mailbox, retries,
+    /// and TLS are entirely that local MTA's own responsibility from this
+    /// point on, not observable by this transport. Throws
+    /// `LocalMTAError.nonZeroExit`/`.processLaunchFailed`/`.timedOut` if the
+    /// local MTA rejects the handoff outright, rather than returning a
+    /// per-recipient failure -- there is no partial-acceptance concept at
+    /// this handoff layer.
     public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
         try await runProcess(envelope: envelope, message: message)
         // The local MTA accepted the handoff (zero exit) -- this is the

@@ -1,10 +1,3 @@
-> **TODO（Phase 0 之后需要补一次文档整理)：** 本文档描述的是基于 libcurl 的旧版
-> `EMail`/`SMTPClient`/`Recipient` API，在 Swift 6.2/SwiftNIO 重写
-> （见 `Documentation/swift6-nio-rewrite-plan.md`）之后已不存在。Phase 0 用
-> `PerfectSMTPCore` 的 `EmailMessage`/`EmailAddress`/`SMTPEnvelope`/
-> `MIMEComposer` 类型取代了它；真正的发送 API（`SMTPMailer`）由 Phase 1 添加。
-> 完整的文档重写是另一项未来任务——这里先留一个占位说明，避免文档悄悄过时。
-
 # Perfect - SMTP 简单邮件协议 [English](README.md)
 
 <p align="center">
@@ -16,185 +9,159 @@
 <p align="center">
     <a href="https://github.com/PerfectlySoft/Perfect" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_1_Star.jpg" alt="Star Perfect On Github" />
-    </a>  
+    </a>
     <a href="https://gitter.im/PerfectlySoft/Perfect" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_2_Git.jpg" alt="Chat on Gitter" />
-    </a>  
+    </a>
     <a href="https://twitter.com/perfectlysoft" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_3_twit.jpg" alt="Follow Perfect on Twitter" />
-    </a>  
+    </a>
     <a href="http://perfect.ly" target="_blank">
         <img src="http://www.perfect.org/github/Perfect_GH_button_4_slack.jpg" alt="Join the Perfect Slack" />
     </a>
 </p>
 
 <p align="center">
-    <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-4.1-orange.svg?style=flat" alt="Swift 4.1">
+    <a href="https://www.swift.org/" target="_blank">
+        <img src="https://img.shields.io/badge/Swift-6.2-orange.svg?style=flat" alt="Swift 6.2">
     </a>
-    <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Platforms-OS%20X%20%7C%20Linux%20-lightgray.svg?style=flat" alt="Platforms OS X | Linux">
+    <a href="https://developer.apple.com/macos/" target="_blank">
+        <img src="https://img.shields.io/badge/Platforms-macOS%2026%2B-lightgray.svg?style=flat" alt="Platforms macOS 26+">
     </a>
-    <a href="http://perfect.org/licensing.html" target="_blank">
-        <img src="https://img.shields.io/badge/License-Apache-lightgrey.svg?style=flat" alt="License Apache">
+    <a href="LICENSE" target="_blank">
+        <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg?style=flat" alt="License Apache 2.0">
     </a>
     <a href="http://twitter.com/PerfectlySoft" target="_blank">
         <img src="https://img.shields.io/badge/Twitter-@PerfectlySoft-blue.svg?style=flat" alt="PerfectlySoft Twitter">
     </a>
-    <a href="https://gitter.im/PerfectlySoft/Perfect?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge" target="_blank">
-        <img src="https://img.shields.io/badge/Gitter-Join%20Chat-brightgreen.svg" alt="Join the chat at https://gitter.im/PerfectlySoft/Perfect">
-    </a>
-    <a href="http://perfect.ly" target="_blank">
-        <img src="http://perfect.ly/badge.svg" alt="Slack Status">
-    </a>
 </p>
 
+> **翻译说明：** 本文档由机器翻译并经过人工审阅，但尚未经过以 SMTP/DKIM 等协议
+> 术语为母语背景的技术审校。协议术语（STARTTLS、DKIM、MTA-STS、SASL 等）保留英文
+> 原文以避免歧义。如发现术语或语义不准确之处，请以 [English](README.md) 版本为准，
+> 并欢迎提交修正。
 
-本项目提供了SMTP函数库封装。
+Perfect-SMTP 是一个基于 Swift 6.2 / SwiftNIO 从零编写的 SMTP 客户端。它不是对
+libcurl 或其他邮件库的封装——它自己实现了 SMTP 线路协议，包括自己的 STARTTLS
+状态机、连接池、DKIM 签名，以及 MTA-STS 策略执行。
 
-该软件使用SPM进行编译和测试，本软件也是[Perfect](https://github.com/PerfectlySoft/Perfect)项目的一部分。
+它提供三种投递策略（中继到现有 SMTP 主机、交给本地 MTA 如 Postfix/sendmail、
+或自行解析 MX 记录直接投递），你可以选择与现有邮件运维方式匹配的一种，也可以
+让 Perfect-SMTP 本身充当最终的 MTA。
 
-请确保您已经安装并激活了最新版本的 Swift 4.1.1 tool chain 工具链。
+> 这是 2026 年之前基于 libcurl 的旧版 Perfect-SMTP 的完整重写。如果你使用过旧版
+> `EMail`/`SMTPClient`/`Recipient` API，请参阅用户指南中的
+> [从旧版 Perfect-SMTP 迁移](Documentation/user-guide.md#migrating-from-the-old-perfect-smtp)
+> 一节——这不是一次可以直接替换的升级。
 
-## Linux 编译注意事项
+## 功能特性
 
-请确保编译之前您的 Ubuntu 16.04 上已经安装了 `libssl-dev` 程序库：
+- **基于 SwiftNIO 手写的 SMTP 客户端**——自有的 STARTTLS 升级流程，对注入/降级
+  攻击有精确到字节的缓冲区安全保证；带断路器的连接池；支持 PIPELINING。
+- **DKIM 签名**（RFC 6376）——支持 RSA-SHA256 和 Ed25519-SHA256（RFC 8463），
+  包括双重签名；自动对安全敏感的头字段做 oversigning（过度签名）；内置
+  DMARC 对齐检查（lint）。
+- **三种投递策略**——`RelayTransport`（ESP 或现有 SMTP 中继）、
+  `LocalMTATransport`（交给同一主机上的 `sendmail`/Postfix）、
+  `DirectMXTransport`（自行解析 MX 记录直接投递，带自己的重试队列和断路器）。
+- **MTA-STS**（RFC 8461）——针对直连 MX 投递的策略发现、缓存与执行，并默认
+  启用机会性（opportunistic）STARTTLS。
+- **SASL 认证**——`PLAIN`、`LOGIN`、`XOAUTH2`（Gmail/Workspace 必需，
+  Microsoft 365 也在逐步要求使用）。
+- **送达率相关头字段**——`List-Unsubscribe`/`List-Unsubscribe-Post`
+  （RFC 8058）、`Precedence`、`Auto-Submitted`——自 2025 年 11 月起
+  Gmail 和 Yahoo 已对批量发件人强制要求这些头字段。
+- **面向批量/列表服务器场景**——有并发上限的批量 `send`，以及基于
+  `AsyncSequence` 的流式 `send`，可以在不将全部收件人一次性载入内存的情况下
+  发送给数百万收件人。
+- **结构化的投递结果**——每次发送都会为每个收件人返回一个结果（已送达、
+  已排队重试、永久失败、已过期、结果不明确，或传输层失败），而不是单一的
+  成功/失败标志。
 
+除下面的基础用法之外的内容，请参阅**[完整用户指南](Documentation/user-guide.md)**。
+
+## 环境要求
+
+- Swift 6.2 工具链（`swift-tools-version: 6.2`，`.swiftLanguageMode(.v6)`）
+- macOS 26 或更高版本（`Package.swift` 声明 `platforms: [.macOS(.v26)]`）
+
+## 安装
+
+在你的 `Package.swift` 中添加依赖：
+
+```swift
+.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "6.0.0")
 ```
-$ sudo apt-get install libssl-dev
+
+并依赖 `PerfectSMTP` 产品（它重新导出了 `PerfectSMTPCore`；只有在你需要不经
+发送、单独完成消息组合/签名时才需要直接依赖 `PerfectSMTPCore`）：
+
+```swift
+.target(
+    name: "YourTarget",
+    dependencies: [
+        .product(name: "PerfectSMTP", package: "Perfect-SMTP"),
+    ]
+)
 ```
 
-## 最佳实践
+## 快速开始
 
-在开始使用Perfect-SMTP编程之前，建议尝试 [SMTP / curl 命令行范例](https://ec.haxx.se/usingcurl-smtp.html).
+通过一个现有的 SMTP 中继（企业自有 MTA，或 SendGrid/Postmark/SES 等 ESP）
+发送一封邮件：
 
-该命令行有助于理解SMTP协议，并且能够帮助您在编程之前调试好SMTP服务器。
-
-
-## 快速上手
-
-使用 SMTP 库函数之前，请首先修改您的项目 Package.swift 文件并增加如下依存关系：
-
-``` swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "3.0.0")
-```
-
-随后在源代码开始部分增加导入说明：
-
-``` swift
+```swift
 import PerfectSMTP
-```
+import NIOPosix
 
-## 主要数据结构
+let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
-Perfect SMTP 包含三类数据结构： SMTPClient, Recipient and EMail.
+let transport = RelayTransport(
+    config: RelayConfig(
+        host: "smtp.example.com",
+        port: 587,
+        tls: .startTLS,
+        auth: .plain(username: "postmaster@example.com", password: "secret")
+    ),
+    group: group
+)
+let mailer = SMTPMailer(transport: transport)
 
-### SMTPClient
+var message = EmailMessage(from: EmailAddress(displayName: "Ops", address: "ops@example.com"))
+message.to = [EmailAddress(address: "user@dest.com")]
+message.subject = "Hello from Perfect-SMTP"
+message.textBody = "Hi there!"
 
-SMTPClient 对象用于存储连接到邮件服务器的登录信息，比如下列例子：
-
-``` swift
-let client = SMTPClient(url: "smtp://邮件服务器域名地址", username: "某人@某地址", password:"密码")
-```
-
-### Recipient
-
-Recipient 是用于处理用户名和邮件地址标准化的一个数据结构：
-
-``` swift
-let recipient = Recipient(name: "收件人/寄件人全名", address: "某人@某网络")
-```
-
-### EMail
-
-EMail 对象用于起草和发送邮件，参考如下例子：
-
-``` swift
-// 起草一封邮件，首先用登录信息初始化邮件
-var email = EMail(client: client)
-
-// 设置标题
-email.subject = "邮件标题"
-
-// 设置寄件人信息
-email.from = Recipient(name: "寄件人姓名", address: "我@电邮地址")
-
-// 邮件正文，可以是HTML格式，也可以是普通文本
-email.html = "<h1>Hello, world!</h1><hr><img src='http://www.perfect.org/images/perfect-logo-2-0.svg'>"
-
-// 设置收件人，包括收件人、抄送和秘密抄送
-email.to.append(Recipient(name: "收件人全名", address: "某人@某地址"))
-email.cc.append(Recipient(name: "抄送", address: "某人@某其他地址"))
-email.bcc.append(Recipient(name: "密送", address: "某人@某处"))
-
-// 追加附件
-email.attachments.append("/本地/计算机/文件.txt")
-email.attachments.append("/本地/电脑/照片.jpg")
-
-// 发送邮件，发送结束后回调
-do {
-  try email.send { code, header, body in
-    /// 打印邮件服务器响应信息
-    print(code)
-    print(header)
-    print(body)
-  }//end send
-}catch(let err) {
-  /// 如果程序运行到了这里，表示发送不成功
+let results = try await mailer.send(message, envelopeFrom: .address("ops@example.com"))
+for result in results {
+    print(result.recipient, result.outcome)
 }
+
+try await group.shutdownGracefully()
 ```
 
-#### EMail 对象的成员变量和成员函数
+基础用法就是这些。关于 DKIM 签名、直连 MX 投递、认证方式、批量发送以及
+送达率相关头字段，请参阅**[用户指南](Documentation/user-guide.md)**。
 
-- client: SMTPClient，邮件服务器登录信息
-- to: [Recipient]，收件人数组
-- cc: [Recipient]，抄送人地址数组
-- bcc:[Recipient]，密送人地址数组
-- from: Recipient，当前寄件人地址
-- subject: String，邮件标题
-- attachments: [String]，邮件附件文件名构成的数组，比如 ["/本地/计算机/文件.txt", "/本地/电脑/照片.jpg" ...]
-- content: String，邮件正文，可以是普通文本，或者是HTML
-- html: String，邮件正文的别名，和content 使用相同的变量
-- text: String，将邮件内容设置为纯文本
-- send(completion: @escaping ((Int, String, String)->Void))，邮件发送函数，参数为回调函数。
-回调函数包括以下三个参数，详细含义请参考 Perfect-CURL `performFully()`函数：
-  - code: Int，邮件服务器响应代码，正常值是零。
-  - header: String，邮件响应头数据字符串。
-  - body: String，邮件响应体数据字符串。
+## 测试
 
-
-## 示范程序
-
-在github上有一个完整邮件发送程序供参考：
-[Perfect SMTP Demo](https://github.com/PerfectExamples/Perfect-SMTP-Demo)
-
-## SMTPS协议注意事项
-
-我们收到了很多关于google smtp示范的要求，在此感谢 @ucotta 、@james，当然还有来自Perfect 官方专业支持的 @iamjono，以下说明可能会为您的gmail客户端开发有所帮助： ⚠️*SMTPClient 的地址应该设置为 `smtps://smtp.gmail.com`，并且在谷歌设置中一定要开启[“降低安全性以便于某些传统客户端访问”](https://myaccount.google.com/lesssecureapps)*⚠️
-
-以下是使用SMTPS加密协议的示范例子（以gmail为例）
-
-``` swift
-import PerfectSMTP
-
-let client = SMTPClient(url: "smtps://smtp.gmail.com", username: "yourname@gmail.com", password:"yourpassword")
-
-var email = EMail(client: client)
-
-email.subject = "a topic"
-email.content = "a message"
-
-email.cc.append(Recipient(address: "who@where.com"))
-
-do {
-  try email.send { code, header, body in
-    /// response info from mail server
-    print(code)
-  }//end send
-}catch(let err) {
-  /// something wrong
-}
+```
+swift test
 ```
 
-## 更多信息
-关于本项目更多内容，请参考[perfect.org](http://perfect.org).
+全部 323 个测试都无需任何外部服务或环境变量即可运行——其中包括会打开真实
+loopback 套接字的测试（一次 STARTTLS 握手和一次完整的 DirectMX 投递，各自
+针对 `127.0.0.1` 上一个进程内的伪 SMTP 服务器运行），但这里没有任何测试会
+连接真实网络或真实邮件服务器。
+
+说明：原始重写计划文档（`Documentation/swift6-nio-rewrite-plan.md` §4.1/§5）
+中描述了另一层通过 `SMTP_TESTS=1` 环境变量启用、针对 MailHog/smtp4dev CI
+服务容器的实时集成测试。这一层从未被实现——`Tests/` 目录下没有任何地方引用
+这个环境变量，本仓库也没有任何 CI 工作流文件。如果你需要针对真实 SMTP 服务器
+做验证，可以自行将 `RelayTransport` 或 `DirectMXTransport` 指向本地的
+MailHog/smtp4dev 实例；参见用户指南中的
+[测试你的集成](Documentation/user-guide.md#testing-your-integration)一节。
+
+## 许可证
+
+Apache License 2.0——详见 [LICENSE](LICENSE)。
