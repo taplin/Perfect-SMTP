@@ -80,12 +80,24 @@ public final class SMTPConnection: @unchecked Sendable {
     /// command round-trip. Used only in `sendBodyAndFinalize`'s final-reply
     /// wait; every other command uses `replyTimeout`.
     private let dataTerminationTimeout: Duration
+    /// FIX (plan §4.8, Phase 3 follow-through on Phase 1's own deferred
+    /// item): the 421-vs-greylist-vs-other-4yz backoff durations applied by
+    /// `outcomeFor` below. Defaults to the exact values Phase 1 originally
+    /// hardcoded, so every existing caller (`RelayTransport`,
+    /// `LocalMTATransport`'s N/A here, and every Phase 1/2 test) is
+    /// unaffected unless it opts in to a different policy.
+    /// `DirectMXTransport` passes its own `DirectMXRetryQueue`'s configured
+    /// policy here, so a RCPT/DATA-phase rejection and a MAIL-FROM-phase
+    /// rejection for the same destination get the identical configured
+    /// backoff instead of two independently-hardcoded copies of it.
+    private let backoffPolicy: RetryBackoffPolicy
 
     public init(
         asyncChannel: NIOAsyncChannel<SMTPReply, SMTPCommand>,
         ehloHostname: String,
         replyTimeout: Duration = .seconds(300),
-        dataTerminationTimeout: Duration = .seconds(600)
+        dataTerminationTimeout: Duration = .seconds(600),
+        backoffPolicy: RetryBackoffPolicy = .init()
     ) {
         self.channel = asyncChannel.channel
         // Intentional use of the unscoped, deprecated `.inbound`/`.outbound`
@@ -100,6 +112,7 @@ public final class SMTPConnection: @unchecked Sendable {
         self.ehloHostname = ehloHostname
         self.replyTimeout = replyTimeout
         self.dataTerminationTimeout = dataTerminationTimeout
+        self.backoffPolicy = backoffPolicy
     }
 
     /// Reads the next reply, or throws if the connection closed
@@ -381,23 +394,13 @@ public final class SMTPConnection: @unchecked Sendable {
 
     /// Phase 1's job is correct single-attempt classification, not a full
     /// retry scheduler (plan §4.8's explicit scope boundary — the actual
-    /// scheduling/execution of retries is Phase 3 territory). The backoff
-    /// durations below are placeholders populating `DeliveryResult`'s
-    /// existing `.queuedForRetry(nextAttempt:...)` shape correctly (per the
-    /// 421-vs-greylist distinction) so callers see a sensible "retry no
-    /// sooner than" hint even though nothing in Phase 1 acts on it yet.
+    /// scheduling/execution of retries is Phase 3 territory). Backoff
+    /// durations (per the 421-vs-greylist distinction) come from
+    /// `backoffPolicy` -- configurable since Phase 3's follow-through (see
+    /// that property's doc comment); Phase 1 callers that never set it get
+    /// the exact same 900s/300s/120s values this method originally
+    /// hardcoded.
     private func outcomeFor(_ reply: SMTPReply) -> DeliveryResult.Outcome {
-        switch reply.replyClass {
-        case .permanentNegative:
-            return .permanentlyFailed(reply)
-        default:
-            let backoff: TimeInterval
-            switch SMTPError.classify(reply) {
-            case .serviceUnavailable: backoff = 900
-            case .greylisted: backoff = 300
-            default: backoff = 120
-            }
-            return .queuedForRetry(nextAttempt: Date().addingTimeInterval(backoff), attempt: 1, last: reply)
-        }
+        backoffPolicy.classify(reply, attempt: 1)
     }
 }

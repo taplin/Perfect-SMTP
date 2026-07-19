@@ -59,6 +59,57 @@ public enum SMTPBootstrap {
         tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
+        try await connect(
+            target: .hostPort(host: host, port: port), sniHostname: host, tls: tls,
+            connectTimeout: connectTimeout, tlsConfiguration: tlsConfiguration, group: group
+        )
+    }
+
+    /// Connects to a pre-resolved socket address rather than letting
+    /// `ClientBootstrap` perform its own hostname resolution -- for
+    /// `DirectMXTransport` (plan §9 Phase 3), which has already resolved an
+    /// MX exchange hostname (or, for the RFC 5321 §5.1 implicit-MX
+    /// fallback, the destination domain itself) to specific A/AAAA
+    /// addresses via `DNSResolver` and must connect to exactly the address
+    /// it resolved -- re-resolving through the OS resolver a second time
+    /// here would silently discard that work (and would also make the
+    /// whole flow untestable without a real network/DNS server).
+    /// `sniHostname` is still the *name* (the MX exchange, or the domain
+    /// for the implicit-MX case), never the IP literal actually dialed --
+    /// TLS SNI and certificate-hostname verification are about the name a
+    /// certificate is expected to match, independent of which specific
+    /// address that name happened to resolve to.
+    public static func connect(
+        to socketAddress: SocketAddress,
+        sniHostname: String,
+        tls: TLSMode,
+        connectTimeout: TimeAmount = .seconds(30),
+        tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
+        group: any EventLoopGroup
+    ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
+        try await connect(
+            target: .socketAddress(socketAddress), sniHostname: sniHostname, tls: tls,
+            connectTimeout: connectTimeout, tlsConfiguration: tlsConfiguration, group: group
+        )
+    }
+
+    /// How the underlying `ClientBootstrap` actually dials -- the only
+    /// thing that differs between the two public overloads above; the
+    /// channel pipeline built below (decoder/encoder/optional implicit-TLS/
+    /// `SMTPBootstrapHandler`) is identical either way.
+    private enum ConnectTarget {
+        case hostPort(host: String, port: Int)
+        case socketAddress(SocketAddress)
+    }
+
+    private static func connect(
+        target: ConnectTarget,
+        sniHostname: String,
+        tls: TLSMode,
+        connectTimeout: TimeAmount,
+        tlsConfiguration: TLSConfiguration,
+        group: any EventLoopGroup
+    ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
         let promise = group.next().makePromise(of: NIOAsyncChannel<SMTPReply, SMTPCommand>.self)
 
         let bootstrap = ClientBootstrap(group: group)
@@ -79,12 +130,12 @@ public enum SMTPBootstrap {
                     )
                     try channel.pipeline.syncOperations.addHandler(SMTPCommandEncoder(), name: Names.encoder)
                     if tls == .implicit {
-                        let sslHandler = try Self.makeSSLHandler(host: host, configuration: tlsConfiguration)
+                        let sslHandler = try Self.makeSSLHandler(host: sniHostname, configuration: tlsConfiguration)
                         try channel.pipeline.syncOperations.addHandler(sslHandler, position: .first)
                     }
                     let handler = SMTPBootstrapHandler(
                         tls: tls,
-                        host: host,
+                        host: sniHostname,
                         tlsConfiguration: tlsConfiguration,
                         readyPromise: promise,
                         initialDecoder: decoder
@@ -94,7 +145,12 @@ public enum SMTPBootstrap {
             }
 
         do {
-            _ = try await bootstrap.connect(host: host, port: port).get()
+            switch target {
+            case .hostPort(let host, let port):
+                _ = try await bootstrap.connect(host: host, port: port).get()
+            case .socketAddress(let address):
+                _ = try await bootstrap.connect(to: address).get()
+            }
             return try await promise.futureResult.get()
         } catch {
             promise.fail(error)
