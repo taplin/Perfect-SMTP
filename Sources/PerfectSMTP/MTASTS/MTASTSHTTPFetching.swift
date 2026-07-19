@@ -79,6 +79,34 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
 /// cache per HTTP semantics would just be a second, uncoordinated cache
 /// with its own, RFC-9111-shaped expiry rules layered underneath the one
 /// that actually matters here, RFC 8461 §3.2's `max_age`).
+///
+/// FIX #3 (MEDIUM security, milestone security review): **redirects are
+/// never followed.** RFC 8461 §3.3 itself is explicit about this -- fetched
+/// and verified directly against the published RFC text, not assumed:
+/// "Policies fetched via HTTPS are only valid if the HTTP response code is
+/// 200 (OK). HTTP 3xx redirects MUST NOT be followed". Before this fix,
+/// `fetch(url:)` called `session.data(for:)` with no delegate at all, so
+/// `URLSession`'s ordinary default behavior applied: HTTP(S) redirects
+/// (including cross-host and cross-scheme, `https://` -> `http://`) were
+/// followed automatically with nothing checking the redirect target. Since
+/// the fetch domain is fully attacker-controlled the moment an attacker
+/// controls a domain being emailed to, a malicious policy server could
+/// redirect this fetch to an internal address or a plaintext-HTTP endpoint
+/// -- a real request-forgery primitive, even though the fetched response is
+/// only ever used for MTA-STS text parsing, never reflected back to anyone.
+///
+/// `RedirectRefusingTaskDelegate` below refuses **every** redirect
+/// unconditionally (`completionHandler(nil)`) rather than attempting to
+/// selectively allow same-host/HTTPS-only redirects -- RFC 8461 doesn't
+/// require or expect redirect support for the well-known policy fetch at
+/// all, so refusing entirely is both the RFC-mandated behavior and the
+/// simplest safe choice. When a redirect is refused this way, the task
+/// completes normally with the original 3xx response as its final result
+/// (not an error) -- `MTASTSPolicyManager.fetchAndParsePolicy`'s existing
+/// `guard response.statusCode == 200` already treats any non-200 status as
+/// `MTASTSDiscoveryError.fetchFailed`, so a refused redirect is correctly
+/// folded into the ordinary "fetch failed" path with no separate handling
+/// needed here.
 public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     private let session: URLSession
 
@@ -90,7 +118,7 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request, delegate: RedirectRefusingTaskDelegate())
         guard let http = response as? HTTPURLResponse else {
             throw MTASTSHTTPFetchError.notAnHTTPResponse
         }
@@ -99,5 +127,23 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
             contentType: http.value(forHTTPHeaderField: "Content-Type"),
             body: Array(data)
         )
+    }
+}
+
+/// FIX #3's mechanism: a per-request `URLSessionTaskDelegate` that refuses
+/// every HTTP redirect unconditionally. `final class ... NSObject`
+/// (`URLSessionTaskDelegate` requires an `NSObject`-conforming delegate on
+/// both Darwin `Foundation` and `FoundationNetworking`), `@unchecked
+/// Sendable`: holds no mutable state at all, so there is nothing for
+/// concurrent task callbacks to race on.
+private final class RedirectRefusingTaskDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        // `nil` -- do not follow the redirect. The task completes with
+        // `response` (the 3xx itself) as its final result.
+        completionHandler(nil)
     }
 }

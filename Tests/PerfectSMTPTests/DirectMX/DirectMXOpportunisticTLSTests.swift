@@ -142,6 +142,116 @@ struct DirectMXOpportunisticTLSTests {
             return
         }
     }
+
+    // MARK: - (4) FIX #1, CRITICAL (milestone security review): the pool's
+    // circuit breaker must never launder a run of detected
+    // STARTTLS-injection attacks into a silent plaintext downgrade.
+    //
+    // The real `SMTPConnectionPool` this transport owns keys its breaker by
+    // `(host, port, tls)`, and `checkout` calls `recordFailure` on *any*
+    // dial failure -- including a detected `.starttlsInjection` -- with no
+    // distinction of cause. After `circuitBreakerThreshold` (default 5)
+    // consecutive failures against `Key(host, port, tls: .startTLS)`, the
+    // breaker opens; while open, `checkBreaker` throws a bare
+    // `SMTPError.circuitOpen` *before ever dialing again*. Before this fix,
+    // `attemptOpportunisticHostsInOrder`'s catch block only pattern-matched
+    // `.starttlsInjection` specifically, so `.circuitOpen` fell through to
+    // the ordinary opportunistic-fallback branch and immediately retried
+    // the *same* host with `Key(host, port, tls: .none)` -- plaintext, to
+    // the exact attacker-controlled path that just proved itself hostile
+    // five times in a row.
+    //
+    // This test exercises the *real* `SMTPConnectionPool` breaker logic
+    // (via `DirectMXTransport`'s production `init(resolver:config:group:...)`,
+    // not the test-only injectable-dialer seam) against a real socket, the
+    // same way scenario (3) above does -- the bug is specifically in the
+    // interaction between the pool's breaker bookkeeping and the
+    // transport's opportunistic-fallback decision, so a mock that bypasses
+    // either one would not actually exercise it.
+
+    @Test func circuitBreakerOpenedByRepeatedSTARTTLSInjectionDetectionsMustNeverLaunderIntoAPlaintextRetryAgainstTheSameHost() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let plaintextDeliveryCount = CountingFlag()
+        let server = try await InjectOnSTARTTLSButPlaintextAcceptingFakeSMTPServer.start(
+            group: group, onPlaintextDelivery: { await plaintextDeliveryCount.increment() }
+        )
+
+        let resolver = FakeMXResolver(
+            mxRecords: ["breakerlaundering.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.breakerlaundering.example")]],
+            addresses: ["mx.breakerlaundering.example": [.v4([127, 0, 0, 1])]]
+        )
+        // Default `.opportunistic` `tlsPolicy`, no MTA-STS policy provider
+        // -- exactly the default-configuration path FIX #1's finding
+        // applies to. `circuitBreakerThreshold: 5` is spelled out
+        // explicitly (matching the pool's own default) so this test keeps
+        // working even if that default ever changes; `circuitBreakerResetTimeout`
+        // is generously long so the breaker can't coincidentally reset
+        // mid-test.
+        let transport = DirectMXTransport(
+            resolver: resolver,
+            config: DirectMXConfig(
+                port: server.port,
+                pool: .init(circuitBreakerThreshold: 5, circuitBreakerResetTimeout: .seconds(60)),
+                allowPrivateAddresses: true
+            ),
+            group: group
+        )
+
+        // Five consecutive deliveries to the same host, each a detected
+        // STARTTLS-injection attempt -- primes the pool's real breaker for
+        // `Key(host, port, tls: .startTLS)` up to (and, on the fifth, past)
+        // `circuitBreakerThreshold`.
+        for attempt in 1...5 {
+            let recipientEnvelope = try envelope(recipients: ["rcpt\(attempt)@breakerlaundering.example"])
+            let results = try await transport.send(recipientEnvelope, message())
+            guard results.count == 1, case .failed(let error) = results[0].outcome,
+                  let smtpError = error as? SMTPError, case .starttlsInjection = smtpError
+            else {
+                Issue.record("attempt \(attempt): expected a detected STARTTLS-injection failure (to prime the circuit breaker), got \(results.map(\.outcome))")
+                await transport.shutdown()
+                try await server.channel.close()
+                try await group.shutdownGracefully()
+                return
+            }
+        }
+
+        // Sixth attempt: the breaker for `Key(host, port, .startTLS)` is
+        // now open, so `checkBreaker` rejects with a bare
+        // `SMTPError.circuitOpen` *before* ever dialing again -- the fake
+        // server never even sees a sixth STARTTLS attempt. This is the
+        // exact scenario the laundering bug turned into a silent plaintext
+        // delivery: assert it must NOT succeed via `TLSMode.none` against
+        // this host.
+        let sixthEnvelope = try envelope(recipients: ["rcpt6@breakerlaundering.example"])
+        let sixthResults = try await transport.send(sixthEnvelope, message())
+
+        await transport.shutdown()
+        try await server.channel.close()
+        try await group.shutdownGracefully()
+
+        #expect(sixthResults.count == 1)
+        if case .delivered = sixthResults[0].outcome {
+            Issue.record(
+                """
+                SECURITY REGRESSION: the sixth attempt delivered successfully against a host whose circuit \
+                breaker only opened because of five consecutive detected STARTTLS-injection attempts -- \
+                this is the breaker-laundering bug: SMTPError.circuitOpen must never trigger an \
+                opportunistic plaintext retry against the host that tripped it.
+                """
+            )
+        }
+        // The strongest possible assertion: the fake server itself must
+        // never have completed a plaintext (non-STARTTLS) mail
+        // transaction. A nonzero count means some attempt connected to
+        // this host with `TLSMode.none` and successfully delivered in
+        // cleartext -- exactly the downgrade this fix must prevent,
+        // independent of exactly how `DeliveryResult` ends up classifying
+        // it.
+        #expect(
+            await plaintextDeliveryCount.value == 0,
+            "the fake server completed a plaintext mail transaction -- some attempt connected to the injecting host with TLSMode.none and delivered in cleartext"
+        )
+    }
 }
 
 /// A single-set-once, `async`-safe flag -- mirrors `STARTTLSRealSocketTests
@@ -377,6 +487,120 @@ private final class SameBufferInjectingHandler: ChannelInboundHandler, @unchecke
         buffer.writeString("\r\n")
         context.writeAndFlush(Self.wrapOutboundOut(buffer), promise: nil)
     }
+}
+
+// MARK: - Fake server 4 (FIX #1 regression test): combines fake server 3's
+// same-buffer injection-on-STARTTLS behavior with fake server 2's plain
+// full-transaction acceptance -- modeling the real-world danger this fix
+// closes: an on-path attacker who injects when the victim attempts
+// STARTTLS, but who can simply relay/accept a full plaintext SMTP
+// transaction (capturing it in cleartext) if the victim connects with no
+// STARTTLS attempt at all. Reports (via `onPlaintextDelivery`) whenever a
+// full mail transaction completes on a connection that never sent
+// `STARTTLS` -- the direct, server-side signal that a plaintext delivery
+// actually reached this host.
+
+private enum InjectOnSTARTTLSButPlaintextAcceptingFakeSMTPServer {
+    struct Running {
+        let channel: Channel
+        let port: Int
+    }
+
+    static func start(group: any EventLoopGroup, onPlaintextDelivery: @escaping @Sendable () async -> Void) async throws -> Running {
+        let bootstrap = ServerBootstrap(group: group)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(InjectOnSTARTTLSButAcceptPlaintextHandler(onPlaintextDelivery: onPlaintextDelivery))
+                }
+            }
+        let channel = try await bootstrap.bind(host: "127.0.0.1", port: 0).get()
+        guard let port = channel.localAddress?.port else { throw FakeServerError.noLocalPort }
+        return Running(channel: channel, port: port)
+    }
+}
+
+private final class InjectOnSTARTTLSButAcceptPlaintextHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private var accumulated = ByteBuffer()
+    private var inData = false
+    private var usedSTARTTLS = false
+    private let onPlaintextDelivery: @Sendable () async -> Void
+
+    init(onPlaintextDelivery: @escaping @Sendable () async -> Void) {
+        self.onPlaintextDelivery = onPlaintextDelivery
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        writeLine(context: context, "220 fake.example ESMTP")
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = Self.unwrapInboundIn(data)
+        accumulated.writeBuffer(&incoming)
+        if inData {
+            drainDataPhaseIfTerminated(context: context)
+            return
+        }
+        while let line = extractLine(&accumulated) {
+            handle(line: line, context: context)
+        }
+    }
+
+    private func handle(line: String, context: ChannelHandlerContext) {
+        let upper = line.uppercased()
+        if upper.hasPrefix("EHLO") {
+            writeLine(context: context, "250-fake.example Hello")
+            writeLine(context: context, "250 STARTTLS")
+        } else if upper == "STARTTLS" {
+            usedSTARTTLS = true
+            // Same-buffer injection, identical shape to fake server 3.
+            var buffer = context.channel.allocator.buffer(capacity: 64)
+            buffer.writeString("220 Ready to start TLS\r\n")
+            buffer.writeString("EHLO evil.example\r\n")
+            context.writeAndFlush(Self.wrapOutboundOut(buffer), promise: nil)
+        } else if upper.hasPrefix("MAIL FROM") {
+            writeLine(context: context, "250 2.1.0 OK")
+        } else if upper.hasPrefix("RCPT TO") {
+            writeLine(context: context, "250 2.1.5 OK")
+        } else if upper == "DATA" {
+            writeLine(context: context, "354 Go ahead")
+            inData = true
+            drainDataPhaseIfTerminated(context: context)
+        }
+    }
+
+    private func drainDataPhaseIfTerminated(context: ChannelHandlerContext) {
+        let terminator: [UInt8] = [0x0D, 0x0A, 0x2E, 0x0D, 0x0A] // "\r\n.\r\n"
+        guard accumulated.readableBytesView.count >= terminator.count,
+              Array(accumulated.readableBytesView.suffix(terminator.count)) == terminator
+        else { return }
+        accumulated.moveReaderIndex(forwardBy: accumulated.readableBytes)
+        inData = false
+        writeLine(context: context, "250 2.0.0 Queued as 12345")
+        if !usedSTARTTLS {
+            // This connection never attempted STARTTLS at all, yet just
+            // completed a full mail transaction -- a plaintext delivery
+            // reached this (attacker-controlled) host.
+            let callback = onPlaintextDelivery
+            Task { await callback() }
+        }
+    }
+
+    private func writeLine(context: ChannelHandlerContext, _ text: String) {
+        var buffer = context.channel.allocator.buffer(capacity: text.utf8.count + 2)
+        buffer.writeString(text)
+        buffer.writeString("\r\n")
+        context.writeAndFlush(Self.wrapOutboundOut(buffer), promise: nil)
+    }
+}
+
+/// A simple `async`-safe counter -- mirrors `SeenFlag`'s shape above, for
+/// the FIX #1 regression test's plaintext-delivery count.
+private actor CountingFlag {
+    private(set) var value = 0
+    func increment() { value += 1 }
 }
 
 // MARK: - Shared line-extraction helper (LF-terminated, tolerating a

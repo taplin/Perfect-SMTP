@@ -43,22 +43,50 @@ public enum DirectMXTLSPolicy: Sendable, Equatable {
     /// first (mandatory-verified, real certificate/hostname checking, same
     /// as `.startTLS` always does in this codebase); if the server's EHLO
     /// doesn't advertise STARTTLS at all (bootstrap throws
-    /// `.starttlsRequired`) or the handshake itself fails for a genuine,
-    /// non-injection reason (a real NIOSSL/certificate/connection failure),
-    /// retry the *same host* with `TLSMode.none` instead of treating that
-    /// host as unreachable. **Never** falls back to plaintext after a
-    /// detected `SMTPError.starttlsInjection` -- see
+    /// `.starttlsRequired`), retry the *same host* with `TLSMode.none`
+    /// instead of treating that host as unreachable.
+    ///
+    /// FIX #5 (milestone review, doc-accuracy): **the plaintext-fallback
+    /// path described above is essentially unreachable for a handshake/
+    /// certificate failure specifically -- do not read this case as "a
+    /// genuine cert failure falls back to plaintext."** `SMTPBootstrapHandler
+    /// .errorCaught` (Phase 1, unchanged, existing fail-safe fencing)
+    /// classifies **every** error surfacing during the STARTTLS upgrade
+    /// window -- a real NIOSSL/certificate-verification failure exactly as
+    /// much as actual injected bytes -- as `SMTPError.starttlsInjection`.
+    /// That is intentional, correct fail-safe behavior (an attacker's
+    /// injected bytes and a merely-misconfigured certificate are
+    /// deliberately indistinguishable at that layer, so both are treated
+    /// as the more dangerous possibility), but it means this case's
+    /// plaintext retry in practice only ever fires when STARTTLS is
+    /// genuinely **not offered at all** by the peer. A domain whose sole MX
+    /// host advertises STARTTLS but presents a merely-misconfigured
+    /// (non-malicious) certificate will hard-fail that host under
+    /// `.opportunistic` rather than falling back to plaintext -- this is
+    /// the correct, reviewed behavior, not a bug, but is called out
+    /// explicitly here because an earlier version of this doc comment
+    /// described the unreachable-in-practice "genuine cert failure ->
+    /// plaintext retry" path as if it were the common case.
+    ///
+    /// **Never** falls back to plaintext after a detected
+    /// `SMTPError.starttlsInjection` -- see
     /// `DirectMXTransport.deliverToDomain`'s opportunistic-attempt helper
     /// for exactly where that distinction is enforced; an injection
     /// detection on one host simply moves on to the next resolved MX host
     /// (ordinary host-level fallback), never retries that same host
-    /// unauthenticated. When a domain publishes an MTA-STS `testing` or
-    /// `enforce` policy (and a `mtaSTSPolicyProvider` is configured), that
-    /// policy's stronger requirements apply on top of -- and, for
-    /// `enforce`'s mandatory-TLS-only/host-restriction rules, in place of
-    /// -- this opportunistic default for that specific domain; a domain
-    /// with no policy (or an explicit `mode: none` policy) gets exactly
-    /// the behavior described here.
+    /// unauthenticated. The same helper also never retries a host in
+    /// plaintext after `SMTPError.circuitOpen` (FIX #1, milestone security
+    /// review) -- see `mustNeverTriggerAPlaintextRetryAgainstThisHost`'s
+    /// doc comment for why an ambiguous circuit-breaker signal gets the
+    /// same treatment as a confirmed injection detection.
+    ///
+    /// When a domain publishes an MTA-STS `testing` or `enforce` policy
+    /// (and a `mtaSTSPolicyProvider` is configured), that policy's stronger
+    /// requirements apply on top of -- and, for `enforce`'s mandatory-TLS-
+    /// only/host-restriction rules, in place of -- this opportunistic
+    /// default for that specific domain; a domain with no policy (or an
+    /// explicit `mode: none` policy) gets exactly the behavior described
+    /// here.
     case opportunistic
 }
 
@@ -530,6 +558,15 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     /// (ordinary host-level fallback, ultimately still subject to the same
     /// SSRF-class address filtering and circuit breaker as every other
     /// host attempt), never retries the same host unauthenticated.
+    ///
+    /// FIX #1 (milestone security review, CRITICAL -- the breaker-laundering
+    /// finding): `SMTPError.circuitOpen` gets **exactly the same treatment**
+    /// as `.starttlsInjection` here -- see
+    /// `mustNeverTriggerAPlaintextRetryAgainstThisHost`'s doc comment for
+    /// the full explanation of why. Do not special-case `.circuitOpen`
+    /// separately from `.starttlsInjection` at this call site; they must
+    /// stay behind the same guard so a future edit can't reintroduce the
+    /// laundering gap by "fixing" only one of them.
     private static func attemptOpportunisticHostsInOrder(
         _ hosts: [String], port: Int, recipients: [String], mailFrom: ReversePath, message: SignedMessage,
         pool: SMTPConnectionPool, retryQueueConfiguration: DirectMXRetryQueue.Configuration,
@@ -544,11 +581,14 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                 )
             } catch {
                 lastError = error
-                if isSTARTTLSInjection(error) {
+                if mustNeverTriggerAPlaintextRetryAgainstThisHost(error) {
                     // Never fall back to plaintext after a detected
-                    // injection attack against this host -- move on to the
-                    // next resolved MX host instead, exactly like any other
-                    // host-level connection failure.
+                    // injection attack against this host, or after the
+                    // pool's circuit breaker opened for this host's
+                    // `.startTLS` key for *any* reason (including, but not
+                    // limited to, a run of injection detections) -- move on
+                    // to the next resolved MX host instead, exactly like
+                    // any other host-level connection failure.
                     continue
                 }
                 let plaintextKey = SMTPConnectionPool.Key(host: host, port: port, tls: .none)
@@ -566,15 +606,57 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         return nil
     }
 
-    /// `true` only for a genuine, detected STARTTLS-injection attempt (RFC
-    /// 5321 STARTTLS buffer-discipline violation, plan §4.3) -- every other
-    /// thrown error (absence of STARTTLS support, a legitimate certificate/
-    /// handshake failure, a plain connection error, a circuit-open
-    /// rejection) returns `false` and is treated as an ordinary
-    /// opportunistic-fallback trigger.
-    private static func isSTARTTLSInjection(_ error: any Error) -> Bool {
-        guard case SMTPError.starttlsInjection = error else { return false }
-        return true
+    /// `true` for a genuine, detected STARTTLS-injection attempt (RFC 5321
+    /// STARTTLS buffer-discipline violation, plan §4.3) **or** for
+    /// `SMTPError.circuitOpen`. Every other thrown error (absence of
+    /// STARTTLS support, a legitimate certificate/handshake failure, a
+    /// plain connection error) returns `false` and is treated as an
+    /// ordinary opportunistic-fallback trigger (try the same host in
+    /// plaintext).
+    ///
+    /// FIX #1 (milestone security review, CRITICAL -- "the circuit breaker
+    /// launders a detected STARTTLS-injection attack into a silent
+    /// plaintext downgrade"): before this fix, only `.starttlsInjection`
+    /// was excluded here. `SMTPConnectionPool.checkBreaker` throws a bare
+    /// `SMTPError.circuitOpen` -- with **no** associated value carrying
+    /// *why* the breaker opened -- and `SMTPConnectionPool.checkout` calls
+    /// `recordFailure(key)` on every dial failure uniformly, including a
+    /// detected `.starttlsInjection` (see `checkout`'s `catch` clause and
+    /// `attemptOnHost`'s doc comment: an injection detection propagates
+    /// through the dialer/pool exactly like any other dial failure once it
+    /// reaches `SMTPConnectionPool`, which has no injection-specific
+    /// bookkeeping of its own).
+    ///
+    /// That means an attacker able to intercept every connection attempt to
+    /// a host needs only `circuitBreakerThreshold` (default 5) consecutive
+    /// injection attempts -- trivially reachable across a handful of
+    /// recipients or retries within seconds -- to flip that host's
+    /// `Key(host, port, tls: .startTLS)` breaker open. Once open,
+    /// `checkBreaker` rejects with `.circuitOpen` *before ever dialing
+    /// again*, so the previous code here (which only pattern-matched
+    /// `.starttlsInjection` specifically) fell through to the plaintext-
+    /// retry branch and connected the **same attacker-controlled host**
+    /// with `TLSMode.none` -- laundering a confirmed downgrade attack into
+    /// a normal `.delivered` outcome with no logging at all.
+    ///
+    /// `.circuitOpen` is **inherently ambiguous about root cause** -- the
+    /// breaker aggregates every kind of dial failure (timeouts, refused
+    /// connections, TLS failures, injection detections) into one
+    /// consecutive-failure counter with no distinction. Because it *might*
+    /// mean "this host is actively hostile," it must be treated as if it
+    /// always does: never as a legitimate trigger for an opportunistic
+    /// plaintext retry. A circuit-open host that's merely flaky/overloaded
+    /// (the common, non-adversarial case) loses nothing meaningful by not
+    /// getting a plaintext retry either -- `deliverToDomain`'s ordinary
+    /// host-level fallback (try the next resolved MX host, or fail the
+    /// domain if none remain) already covers that case correctly.
+    private static func mustNeverTriggerAPlaintextRetryAgainstThisHost(_ error: any Error) -> Bool {
+        switch error {
+        case SMTPError.starttlsInjection, SMTPError.circuitOpen:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Plan §9 Phase 4's "enforce-mode hard-fail" requirement: a distinct,

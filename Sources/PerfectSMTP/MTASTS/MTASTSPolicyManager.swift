@@ -29,7 +29,7 @@ public protocol MTASTSPolicyProviding: Sendable {
     /// domain has no usable MTA-STS policy right now -- no TXT-record
     /// discovery signal, an HTTPS fetch failure with nothing usable cached,
     /// or a policy file that failed to parse. Never throws: per RFC 8461
-    /// §3.3/§5.1 and plan §9 Phase 4's explicit instruction, every failure
+    /// §3.3 and plan §9 Phase 4's explicit instruction, every failure
     /// mode here degrades to "treat this domain as policy-less" rather than
     /// surfacing as an error `DirectMXTransport` would have to specially
     /// handle -- MTA-STS is opportunistic-by-nature at the discovery layer,
@@ -67,9 +67,77 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         let expiresAt: Date
     }
 
+    /// FIX #2 / FIX #4 (milestone architecture + security review, both
+    /// resolved the same way `DirectMXRetryQueue.Configuration` resolved
+    /// the equivalent-shaped problems for that actor's own cache -- see
+    /// that type's `maxAge`/`maxTotalEntries` doc comments for the
+    /// established precedent this mirrors).
+    public struct Configuration: Sendable {
+        /// FIX #2 (milestone architecture review, BLOCKING): how long past
+        /// a cached policy's own `expiresAt` (`CachedPolicy.expiresAt`,
+        /// `now()` at fetch time plus that policy's own RFC 8461 §3.2
+        /// `max_age`) this manager will still trust and apply it after a
+        /// *subsequent* discovery/fetch/parse failure, before instead
+        /// reverting the domain to policy-less.
+        ///
+        /// **This is this library's own explicit, reviewed policy
+        /// decision, not an RFC 8461 requirement** -- RFC 8461 itself
+        /// specifies no shape for it (see `policy(for:)`'s doc comment for
+        /// the actual RFC text this behavior is grounded in, and why the
+        /// previous doc comment's "§5.1 anti-flapping" citation was wrong).
+        /// Named and recorded here the same way this codebase's DANE-
+        /// deferral decision was recorded in
+        /// `Documentation/swift6-nio-rewrite-plan.md` §9's Phase 4 bullet
+        /// (see that document's corresponding entry for this decision).
+        ///
+        /// Default 5 days (432,000s) -- deliberately matching
+        /// `DirectMXRetryQueue.Configuration.maxAge`'s own default and
+        /// rationale (conventional MTA give-up windows, e.g. Postfix's
+        /// `maximal_queue_lifetime` default) for consistency across this
+        /// codebase's two "how long do we keep trusting stale state"
+        /// decisions, not because RFC 8461 mentions this number anywhere.
+        /// A domain that has been unreachable (DNS or HTTPS) for 5
+        /// straight days is past the point where "assume the old policy
+        /// still applies" is a reasonable default; a domain that
+        /// legitimately decommissioned MTA-STS during that window instead
+        /// reverts to policy-less and delivery can proceed against
+        /// whatever its current, real MX hosts are.
+        public var staleCacheCeiling: Duration
+        /// FIX #4 (MEDIUM security, milestone security review): a hard
+        /// ceiling on how many distinct domains' policies this actor will
+        /// cache at once -- mirroring
+        /// `DirectMXRetryQueue.Configuration.maxTotalEntries`'s identical
+        /// concern (a long-lived process with no cap here would grow this
+        /// dictionary unboundedly, one entry per distinct domain ever
+        /// queried, for the lifetime of the process). Default 10,000,
+        /// matching `maxTotalEntries`'s own default for the same
+        /// consistency reason `staleCacheCeiling` matches `maxAge`.
+        ///
+        /// Eviction policy when a new entry would exceed this cap: evict
+        /// the cached entry with the earliest `expiresAt` first -- a
+        /// cheap, O(n) approximation of LRU (no separate access-order
+        /// bookkeeping needed) that fits this actor's existing shape.
+        /// "Earliest `expiresAt`" is a reasonable proxy for "least
+        /// recently useful" here specifically because every cache write
+        /// sets `expiresAt` to a fresh `now() + max_age` -- a domain that
+        /// hasn't been re-fetched (i.e., re-queried) in a while is exactly
+        /// the one whose `expiresAt` has drifted furthest into the past
+        /// relative to its peers.
+        public var maxCacheEntries: Int
+
+        public init(
+            staleCacheCeiling: Duration = .seconds(5 * 24 * 3600),
+            maxCacheEntries: Int = 10_000
+        ) {
+            self.staleCacheCeiling = staleCacheCeiling
+            self.maxCacheEntries = maxCacheEntries
+        }
+    }
+
     private var cache: [String: CachedPolicy] = [:]
     private let dnsResolver: any TXTResolving
     private let httpFetcher: any MTASTSHTTPFetching
+    private let configuration: Configuration
     /// Injectable purely for deterministic cache-expiry tests (mirroring
     /// this codebase's other "inject the clock" test seams, e.g.
     /// `SMTPConnectionPool`'s own `ContinuousClock` field) -- production
@@ -78,17 +146,22 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
 
     public init(
         dnsResolver: any TXTResolving,
-        httpFetcher: any MTASTSHTTPFetching = URLSessionMTASTSFetcher()
+        httpFetcher: any MTASTSHTTPFetching = URLSessionMTASTSFetcher(),
+        configuration: Configuration = .init()
     ) {
-        self.init(dnsResolver: dnsResolver, httpFetcher: httpFetcher, now: Date.init)
+        self.init(dnsResolver: dnsResolver, httpFetcher: httpFetcher, configuration: configuration, now: Date.init)
     }
 
     /// Test/internal-only initializer: overrides the clock so cache-expiry
     /// tests don't need real `Task.sleep` waits proportional to a
     /// realistic `max_age`.
-    init(dnsResolver: any TXTResolving, httpFetcher: any MTASTSHTTPFetching, now: @escaping @Sendable () -> Date) {
+    init(
+        dnsResolver: any TXTResolving, httpFetcher: any MTASTSHTTPFetching,
+        configuration: Configuration = .init(), now: @escaping @Sendable () -> Date
+    ) {
         self.dnsResolver = dnsResolver
         self.httpFetcher = httpFetcher
+        self.configuration = configuration
         self.now = now
     }
 
@@ -108,22 +181,73 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
 
         do {
             let policy = try await fetchAndParsePolicy(domain: domain)
-            cache[domain] = CachedPolicy(policy: policy, expiresAt: currentTime.addingTimeInterval(policy.maxAge.timeIntervalValue))
+            let expiresAt = currentTime.addingTimeInterval(policy.maxAge.timeIntervalValue)
+            insertIntoCache(domain: domain, policy: policy, expiresAt: expiresAt)
             return policy
         } catch {
-            // RFC 8461 §5.1: a transient fetch failure shouldn't
-            // immediately drop enforcement. This is deliberately not
-            // restricted to "only if the stale entry hasn't technically
-            // expired yet" -- once a domain has successfully published a
-            // policy, the most recent one is still the best information
-            // available on a fetch failure, whether that failure happens
-            // one second or one month past the policy's own `max_age`; the
-            // alternative (silently reverting to policy-less the moment a
-            // single refresh attempt fails) is exactly the flapping this
-            // guidance exists to prevent. Only when there is no prior
-            // policy at all does a fetch failure mean "no MTA-STS policy."
-            return cache[domain]?.policy
+            // FIX #2 (milestone architecture review, BLOCKING -- corrected
+            // citation): RFC 8461 §3.3 (fetched and verified directly
+            // against the published RFC text, not assumed), not a
+            // nonexistent "§5.1 anti-flapping" rule (no such text exists
+            // anywhere in RFC 8461):
+            //
+            //   "If a valid TXT record is found but no policy can be
+            //   fetched via HTTPS (for any reason), and there is no valid
+            //   (non-expired) previously cached policy, senders MUST
+            //   continue with delivery as though the domain has not
+            //   implemented MTA-STS. Conversely, if no 'live' policy can be
+            //   discovered via DNS or fetched via HTTPS, but a valid
+            //   (non-expired) policy exists in the sender's cache, the
+            //   sender MUST apply that cached policy."
+            //
+            // The RFC's own fallback is explicitly gated on the cached
+            // policy being "valid (non-expired)" -- not indefinitely stale.
+            // This actor's cache-lookup fast path above already only ever
+            // returns a policy while `expiresAt > currentTime` (i.e.,
+            // genuinely non-expired) with zero network calls; this `catch`
+            // branch is reached only once that's no longer true (the
+            // policy's own `max_age` has elapsed and a refresh was
+            // attempted). Falling back to the stale cached policy here
+            // even briefly past its own expiry is a **local, explicit,
+            // reviewed extension** beyond the RFC's literal text (bounded
+            // by `configuration.staleCacheCeiling`, not indefinite) --
+            // see that property's doc comment for the full reasoning and
+            // why an unbounded version of this fallback is a real
+            // availability bug: a domain that legitimately decommissions
+            // MTA-STS (removes its `_mta-sts` TXT record and well-known
+            // policy file, e.g. after a hosting/DNS migration) would
+            // otherwise have this sender continue enforcing its old,
+            // abandoned `enforce` policy forever, since a DNS discovery
+            // failure is folded into the very same fallback path as an
+            // HTTPS fetch failure. Past the ceiling, a fetch failure
+            // reverts the domain to policy-less, exactly matching RFC
+            // 8461 §3.3's literal "non-expired" gating -- no cached
+            // `enforce`/`testing` constraint outlives its own `max_age`
+            // by more than `staleCacheCeiling`.
+            guard let cached = cache[domain] else { return nil }
+            let staleSince = currentTime.timeIntervalSince(cached.expiresAt)
+            guard staleSince <= configuration.staleCacheCeiling.timeIntervalValue else {
+                cache.removeValue(forKey: domain)
+                return nil
+            }
+            return cached.policy
         }
+    }
+
+    /// FIX #4 (MEDIUM security, milestone security review): enforces
+    /// `configuration.maxCacheEntries` on every cache write -- see that
+    /// property's doc comment for the eviction policy (earliest
+    /// `expiresAt` first) and rationale. A write that merely refreshes an
+    /// already-cached domain never counts against the cap (it's not a new
+    /// entry), so this only ever evicts when a genuinely new domain would
+    /// push `cache.count` past the configured limit.
+    private func insertIntoCache(domain: String, policy: MTASTSPolicy, expiresAt: Date) {
+        if cache[domain] == nil, cache.count >= configuration.maxCacheEntries {
+            if let oldestDomain = cache.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
+                cache.removeValue(forKey: oldestDomain)
+            }
+        }
+        cache[domain] = CachedPolicy(policy: policy, expiresAt: expiresAt)
     }
 
     /// Discovery (RFC 8461 §3.1) + fetch (§3.2) + parse, as one throwing
