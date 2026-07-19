@@ -1,3 +1,10 @@
+> **TODO（Phase 0 之后需要补一次文档整理)：** 本文档描述的是基于 libcurl 的旧版
+> `EMail`/`SMTPClient`/`Recipient` API，在 Swift 6.2/SwiftNIO 重写
+> （见 `Documentation/swift6-nio-rewrite-plan.md`）之后已不存在。Phase 0 用
+> `PerfectSMTPCore` 的 `EmailMessage`/`EmailAddress`/`SMTPEnvelope`/
+> `MIMEComposer` 类型取代了它；真正的发送 API（`SMTPMailer`）由 Phase 1 添加。
+> 完整的文档重写是另一项未来任务——这里先留一个占位说明，避免文档悄悄过时。
+
 # Perfect - SMTP 简单邮件协议 [English](README.md)
 
 <p align="center">

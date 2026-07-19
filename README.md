@@ -1,3 +1,12 @@
+> **TODO (post-Phase-0 doc pass):** This README describes the pre-rewrite,
+> libcurl-based `EMail`/`SMTPClient`/`Recipient` API, which no longer
+> exists as of the Swift 6.2/SwiftNIO rewrite
+> (`Documentation/swift6-nio-rewrite-plan.md`). Phase 0 replaced it with
+> `PerfectSMTPCore`'s `EmailMessage`/`EmailAddress`/`SMTPEnvelope`/
+> `MIMEComposer` types; Phase 1 adds the actual sending API
+> (`SMTPMailer`). A full documentation rewrite is a separate future task —
+> this note is a placeholder so the gap is visible, not silently stale.
+
 # Perfect - SMTP [简体中文](README.zh_CN.md)
 
 <p align="center">
