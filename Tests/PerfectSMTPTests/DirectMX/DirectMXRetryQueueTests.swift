@@ -162,6 +162,62 @@ struct DirectMXRetryQueueTests {
         await queue.shutdown()
     }
 
+    // MARK: - FIX #6 (LOW-MEDIUM security, milestone security review): a
+    // hard cap on total pending entries.
+
+    @Test func enqueueAtCapacityReportsFailedRatherThanGrowingUnbounded() async throws {
+        let collector = OutcomeCollector()
+        let config = DirectMXRetryQueue.Configuration(
+            // A backoff far enough in the future that nothing enqueued
+            // below is ever redelivered during this test -- the point is
+            // to observe `enqueue`'s own immediate capacity check, not the
+            // background loop.
+            backoff: .init(serviceUnavailable: .seconds(3600), greylist: .seconds(3600), defaultTransient: .seconds(3600)),
+            maxAttempts: 10, maxAge: .seconds(3600),
+            maxTotalEntries: 3
+        )
+        let queue = DirectMXRetryQueue(
+            configuration: config,
+            redeliver: { envelope, _ in
+                envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        func enqueueOne(_ recipient: String) async -> Bool {
+            await queue.enqueue(
+                recipients: [recipient], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+                outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(3600), attempt: 1, last: reply)
+            )
+        }
+
+        // Fill the queue to exactly `maxTotalEntries` (3) -- all three must be accepted.
+        #expect(await enqueueOne("a@example.com"))
+        #expect(await enqueueOne("b@example.com"))
+        #expect(await enqueueOne("c@example.com"))
+        #expect(await queue.pendingEntriesSnapshot().count == 3)
+
+        // The fourth must be rejected immediately -- not silently dropped
+        // (it's reported via `onTerminalOutcome`, distinctly, as `.failed`)
+        // and not grown past the cap (`entries.count` stays at 3).
+        let fourthAccepted = await enqueueOne("d@example.com")
+        #expect(!fourthAccepted)
+        #expect(await queue.pendingEntriesSnapshot().count == 3)
+
+        let terminal = try await collector.waitForFirst()
+        #expect(terminal.recipient == "d@example.com")
+        guard case .failed(let error) = terminal.outcome, let queueError = error as? DirectMXRetryQueueError,
+              case .queueAtCapacity(let maxTotalEntries) = queueError
+        else {
+            Issue.record("expected .failed(.queueAtCapacity), got \(terminal.outcome)")
+            return
+        }
+        #expect(maxTotalEntries == 3)
+
+        await queue.shutdown()
+    }
+
     // MARK: - Lifecycle: shutdown cancels the background loop cleanly
 
     @Test func shutdownCancelsTheBackgroundLoopCleanlyAndReportsStillPendingEntries() async throws {
@@ -252,6 +308,74 @@ struct DirectMXRetryQueueTests {
             return
         }
         #expect(await attemptsSoFar.count == 2)
+
+        await queue.shutdown()
+    }
+
+    // MARK: - FIX #3 (concurrency + SMTP-protocol reviews): a nudge-
+    // triggered cancel-and-restart must not leak the superseded loop task
+    // as a permanent duplicate. Every other test in this file enqueues
+    // only one entry, so none of them exercise this branch at all --
+    // `nudgeLoop`'s cancel-and-restart path only runs when a *second*
+    // entry arrives with an earlier `nextAttempt` while the loop is
+    // already asleep on an earlier-enqueued, later-due entry.
+
+    @Test func nudgeRestartCancelsThePreviousLoopTaskInsteadOfLeakingAZombie() async throws {
+        let collector = OutcomeCollector()
+        let config = DirectMXRetryQueue.Configuration(
+            backoff: .init(serviceUnavailable: .milliseconds(1), greylist: .milliseconds(1), defaultTransient: .milliseconds(1)),
+            maxAttempts: 10, maxAge: .seconds(3600)
+        )
+        let queue = DirectMXRetryQueue(
+            configuration: config,
+            redeliver: { envelope, _ in
+                envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        // Entry 1: due comfortably later -- this is what starts the loop
+        // task sleeping on a target that the second enqueue below must
+        // then notice is stale.
+        await queue.enqueue(
+            recipients: ["slow@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(0.4), attempt: 1, last: reply)
+        )
+        // Give the loop time to actually start sleeping on entry 1's
+        // target before nudging it.
+        try await Task.sleep(for: .milliseconds(20))
+        // Entry 2: due much sooner than entry 1's `nextAttempt` -- forces
+        // `nudgeLoop`'s cancel-and-restart branch (not just the
+        // fresh-start branch every other test in this file exercises).
+        await queue.enqueue(
+            recipients: ["fast@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(0.05), attempt: 1, last: reply)
+        )
+
+        let first = try await collector.waitForFirst(timeoutSeconds: 3)
+        let second = try await collector.waitForFirst(timeoutSeconds: 3)
+        #expect(Set([first.recipient, second.recipient]) == Set(["fast@example.com", "slow@example.com"]))
+        guard case .delivered = first.outcome, case .delivered = second.outcome else {
+            Issue.record("expected both entries to resolve .delivered, got \(first.outcome) and \(second.outcome)")
+            return
+        }
+
+        // The decisive assertion (this is the regression coverage for the
+        // zombie-task leak itself, not just "both entries eventually
+        // resolved," which would pass even with a leaked duplicate loop
+        // since `entries`' remove-before-`await` discipline already
+        // prevents double-*redelivery* -- the bug is a leaked *task*, not
+        // corrupted delivery): exactly one `processDueEntries()` call per
+        // entry, proving only one loop task instance was ever actually
+        // driving this queue after the nudge. Before the fix, the
+        // cancelled-but-not-exited old loop task fell through its own
+        // `catch` and kept running as an independent duplicate -- it would
+        // wake on its own stale schedule and call `processDueEntries()`
+        // too (at least once, immediately, since a nudge-triggered
+        // cancellation resumes its sleep right away with nothing yet due),
+        // pushing this count above 2.
+        #expect(await queue.processDueEntriesInvocationCountForTesting == 2)
 
         await queue.shutdown()
     }

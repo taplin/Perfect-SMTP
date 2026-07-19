@@ -71,8 +71,34 @@ public final class RelayTransport: SMTPTransport, Sendable {
         self.key = SMTPConnectionPool.Key(host: config.host, port: config.port, tls: config.tls)
     }
 
+    /// Test/internal-only initializer: overrides the pool's dialer
+    /// entirely, mirroring `SMTPConnectionPool`'s and `DirectMXTransport`'s
+    /// own test seams -- lets pool-health regression tests (e.g. for the
+    /// `isHealthy:`/circuit-breaker fix above) script a connection's
+    /// transaction outcome without a real socket.
+    init(config: RelayConfig, group: any EventLoopGroup, dialer: @escaping @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection) {
+        self.config = config
+        self.pool = SMTPConnectionPool(configuration: config.pool, group: group, dialer: dialer)
+        self.key = SMTPConnectionPool.Key(host: config.host, port: config.port, tls: config.tls)
+    }
+
     public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
-        try await pool.withConnection(to: key) { connection in
+        // FIX (milestone architecture + SMTP-protocol reviews, originally
+        // flagged against `DirectMXTransport.attemptOnHost` but confirmed
+        // to apply equally here): `SMTPConnection.sendMessage` returns
+        // RCPT/DATA-phase rejections as normal `[DeliveryResult]` data,
+        // never throws them (only a MAIL-FROM-level rejection throws, and
+        // that already flows through `withConnection`'s `catch` ->
+        // `healthy: false` unmodified). Without `isHealthy:` here, a
+        // mid-DATA disconnect (`.ambiguous`) or a `421` in the RCPT/DATA
+        // phase would return normally from this closure and be treated as
+        // `healthy: true` -- the same gap the architecture/SMTP-protocol
+        // reviews found in `DirectMXTransport`, reachable here too since
+        // both transports share this same `withConnection`-wrapping shape.
+        // `RelayTransport` has no host-fallback to break, but it still
+        // owns a pool and a circuit breaker whose bookkeeping deserves to
+        // be correct.
+        try await pool.withConnection(to: key, isHealthy: SMTPConnectionPool.deliveryResultsIndicateHealthyConnection) { connection in
             // A pooled connection is reused across many checkouts; only
             // authenticate once per connection (most servers reject a
             // second AUTH on an already-authenticated session).

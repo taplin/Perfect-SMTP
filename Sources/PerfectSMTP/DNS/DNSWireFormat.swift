@@ -57,6 +57,20 @@ public enum DNSWireError: Error, Sendable, Equatable {
     case invalidMXRecordData
     /// A query name label was empty or exceeded 63 bytes (RFC 1035 §2.3.4).
     case invalidLabel
+    /// FIX #4 (plan §9 Phase 3 milestone security review, decompression
+    /// amplification): the total number of compression-pointer jumps
+    /// followed across *every* name in one `decode(_:)` call exceeded
+    /// `DNSMessage.maximumPointerJumpsPerMessage`. Distinct from
+    /// `.compressionPointerLoop` (which bounds a single name's own jump
+    /// chain/loop) -- this is the message-wide budget that exists because
+    /// each RR's `decodeName` call gets a *fresh* per-name visited-set
+    /// with no memoization across RRs: a crafted response packing many
+    /// minimal RRs whose names all point at one shared, maximal-length
+    /// compression chain would otherwise have that same expensive chain
+    /// re-walked and re-copied once per RR, a real (bounded but
+    /// significant, roughly 700-800x on a ~64KB payload) amplification
+    /// even though no single name ever loops or exceeds its own cap.
+    case decompressionBudgetExceeded
 }
 
 /// The DNS record types `DNSResolver` understands. RFC 1035 §3.2.2 (A, CNAME),
@@ -148,6 +162,27 @@ public struct DNSMessage: Sendable, Equatable {
     /// could ever approach it.
     static let maximumPointerJumps = 128
 
+    /// FIX #4 (plan §9 Phase 3 milestone security review, decompression
+    /// amplification): cap on the *total* number of compression-pointer
+    /// jumps followed across every name decoded within one `decode(_:)`
+    /// call, shared across the question section and every answer/
+    /// authority/additional RR (including RDATA-internal names, e.g. an
+    /// MX record's `exchange` or a CNAME's target). `maximumPointerJumps`
+    /// above only bounds a *single* name's own chain; without this
+    /// message-wide budget too, a ~64KB response packing thousands of
+    /// minimal RRs whose names all point at one shared, near-maximal-
+    /// length compression chain forces that same expensive chain to be
+    /// re-walked and re-copied (`String(decoding:)`) once per RR (each
+    /// RR's `decodeName` call gets a fresh, unmemoized visited-set), a
+    /// real, measurable amplification even though no single name ever
+    /// loops or exceeds its own per-name cap. Set to a generous multiple
+    /// (32x) of `maximumPointerJumps` -- comfortably more than any
+    /// legitimate response's total jump count (a real answer section's
+    /// worth of names typically needs a small handful of jumps *each*),
+    /// while still bounding aggregate decompression work to a small,
+    /// constant multiple of one name's own worst case.
+    static let maximumPointerJumpsPerMessage = maximumPointerJumps * 32
+
     /// Cap on the number of labels in one decoded name — defense-in-depth
     /// against a message built from many single-byte labels (RFC 1035
     /// §2.3.4 already limits a real name to 255 octets / effectively far
@@ -221,10 +256,16 @@ public struct DNSMessage: Sendable, Equatable {
         )
 
         var offset = 12
+        // FIX #4: one shared decompression-jump budget for this entire
+        // `decode(_:)` call -- passed by reference through every
+        // `decodeName` call below (question names, RR owner names, and
+        // RDATA-internal names alike), decremented per jump, exhausted
+        // regardless of which individual name's jumps consumed it.
+        var messageJumpBudget = maximumPointerJumpsPerMessage
         var questions: [DNSQuestion] = []
-        questions.reserveCapacity(Int(header.questionCount))
+        questions.reserveCapacity(min(Int(header.questionCount), 64)) // FIX #5: don't trust an unvalidated count for a speculative allocation
         for _ in 0..<header.questionCount {
-            let (name, afterName) = try decodeName(bytes, at: offset)
+            let (name, afterName) = try decodeName(bytes, at: offset, messageJumpBudget: &messageJumpBudget)
             offset = afterName
             guard offset + 4 <= bytes.count else { throw DNSWireError.truncated }
             let qtype = readUInt16(bytes, at: offset)
@@ -235,9 +276,9 @@ public struct DNSMessage: Sendable, Equatable {
 
         func decodeSection(_ count: UInt16) throws -> [DNSResourceRecord] {
             var records: [DNSResourceRecord] = []
-            records.reserveCapacity(Int(count))
+            records.reserveCapacity(min(Int(count), 64)) // FIX #5: ditto -- cap the speculative allocation rather than trusting the header field directly
             for _ in 0..<count {
-                let (record, next) = try decodeResourceRecord(bytes, at: offset)
+                let (record, next) = try decodeResourceRecord(bytes, at: offset, messageJumpBudget: &messageJumpBudget)
                 offset = next
                 records.append(record)
             }
@@ -254,9 +295,9 @@ public struct DNSMessage: Sendable, Equatable {
     }
 
     private static func decodeResourceRecord(
-        _ bytes: [UInt8], at offset: Int
+        _ bytes: [UInt8], at offset: Int, messageJumpBudget: inout Int
     ) throws -> (record: DNSResourceRecord, nextOffset: Int) {
-        let (name, afterName) = try decodeName(bytes, at: offset)
+        let (name, afterName) = try decodeName(bytes, at: offset, messageJumpBudget: &messageJumpBudget)
         var pos = afterName
         guard pos + 10 <= bytes.count else { throw DNSWireError.truncated }
         let type = readUInt16(bytes, at: pos)
@@ -279,10 +320,10 @@ public struct DNSMessage: Sendable, Equatable {
         case DNSRecordType.mx.rawValue:
             guard rdlength >= 3 else { throw DNSWireError.invalidMXRecordData }
             let preference = readUInt16(bytes, at: rdataStart)
-            let (exchange, _) = try decodeName(bytes, at: rdataStart + 2)
+            let (exchange, _) = try decodeName(bytes, at: rdataStart + 2, messageJumpBudget: &messageJumpBudget)
             rdata = .mx(preference: preference, exchange: exchange)
         case DNSRecordType.cname.rawValue:
-            let (target, _) = try decodeName(bytes, at: rdataStart)
+            let (target, _) = try decodeName(bytes, at: rdataStart, messageJumpBudget: &messageJumpBudget)
             rdata = .cname(target)
         default:
             rdata = .other(raw: Array(bytes[rdataStart..<rdataEnd]))
@@ -311,7 +352,36 @@ public struct DNSMessage: Sendable, Equatable {
     /// moment `A` is revisited) and a hard cap (`maximumPointerJumps`) on
     /// the total number of jumps for one name (belt-and-suspenders against
     /// any non-repeating-but-still-pathological chain).
+    ///
+    /// This overload (no `messageJumpBudget:`) is the standalone
+    /// entry point `DNSWireFormatTests` exercises directly against
+    /// hand-crafted byte fixtures with no surrounding `decode(_:)` call --
+    /// it supplies a fresh, single-name-sized budget so those tests keep
+    /// asserting exactly the per-name behavior they already cover. Every
+    /// call *from* `decode(_:)` goes through the `messageJumpBudget:`
+    /// overload below instead, threading one shared budget across the
+    /// whole message (FIX #4).
     static func decodeName(_ bytes: [UInt8], at startOffset: Int) throws -> (name: String, nextOffset: Int) {
+        var standaloneBudget = maximumPointerJumps
+        return try decodeName(bytes, at: startOffset, messageJumpBudget: &standaloneBudget)
+    }
+
+    /// FIX #4 (plan §9 Phase 3 milestone security review, decompression
+    /// amplification): identical to the overload above, except every
+    /// compression-pointer jump also debits `messageJumpBudget` -- a
+    /// counter the caller (`decode(_:)`) shares across every name decoded
+    /// within one message, so a crafted response that spreads its
+    /// decompression cost across many RRs (rather than concentrating it in
+    /// one pathological name, which the per-name `maximumPointerJumps` cap
+    /// above already catches) is still bounded in aggregate. Throws
+    /// `.decompressionBudgetExceeded` distinctly from
+    /// `.compressionPointerLoop` -- the latter means *this* name's own
+    /// chain looped or ran long; the former means the *message-wide*
+    /// budget ran out, which could be this name's fault or the cumulative
+    /// effect of many earlier names in the same `decode(_:)` call.
+    static func decodeName(
+        _ bytes: [UInt8], at startOffset: Int, messageJumpBudget: inout Int
+    ) throws -> (name: String, nextOffset: Int) {
         var offset = startOffset
         var labels: [String] = []
         var visitedPointers = Set<Int>()
@@ -335,6 +405,8 @@ public struct DNSMessage: Sendable, Equatable {
                 if firstJumpNextOffset == nil { firstJumpNextOffset = offset + 2 }
                 jumps += 1
                 guard jumps <= maximumPointerJumps else { throw DNSWireError.compressionPointerLoop }
+                messageJumpBudget -= 1
+                guard messageJumpBudget > 0 else { throw DNSWireError.decompressionBudgetExceeded }
                 guard visitedPointers.insert(pointer).inserted else { throw DNSWireError.compressionPointerLoop }
                 guard pointer < bytes.count else { throw DNSWireError.malformedPointer }
                 offset = pointer

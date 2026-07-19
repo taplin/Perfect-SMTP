@@ -34,6 +34,13 @@ public enum DirectMXRetryQueueError: Error, Sendable, Equatable {
     /// not-yet-resolved retry entry -- see `shutdown()`'s doc comment for
     /// why this is surfaced rather than silently dropped.
     case shutdownWhilePending(attempt: Int, last: SMTPReply)
+    /// FIX #6 (LOW-MEDIUM security, milestone security review): `enqueue`
+    /// was called while this queue already held
+    /// `Configuration.maxTotalEntries` pending entries -- the new entry is
+    /// reported as this terminal `.failed` outcome immediately rather than
+    /// silently dropped or grown past the configured cap. See
+    /// `Configuration.maxTotalEntries`'s doc comment.
+    case queueAtCapacity(maxTotalEntries: Int)
 }
 
 /// Schedules and drives automatic re-delivery attempts for recipients whose
@@ -90,15 +97,36 @@ public actor DirectMXRetryQueue {
         /// `maximal_queue_lifetime` defaults to 5 days) -- plan §4.8's
         /// "~4-5 days" guidance.
         public var maxAge: Duration
+        /// FIX #6 (LOW-MEDIUM security, milestone security review): a hard
+        /// ceiling on how many entries this queue will hold pending at
+        /// once, regardless of how many distinct, transiently-failing
+        /// domains a caller sends to. Nothing else in this actor bounds
+        /// `entries`' size -- a high-volume or misbehaving caller
+        /// repeatedly sending to many distinct, transiently-failing
+        /// domains has no ceiling otherwise, and each `Entry` carries a
+        /// full `SignedMessage` (not a reference), so memory is
+        /// proportional to (pending recipients) × (message size).
+        /// Default 10,000 -- generous headroom for realistic retry-queue
+        /// depth (bounded in practice by `maxAge`'s 5-day window and
+        /// realistic transient-failure rates) while still being a hard,
+        /// finite ceiling. When `enqueue` would exceed this, the outcome
+        /// is reported `.failed(DirectMXRetryQueueError.queueAtCapacity)`
+        /// (via `onTerminalOutcome`, exactly like any other terminal
+        /// outcome) rather than silently dropped or grown past the cap --
+        /// losing track of real mail silently would be worse than
+        /// surfacing a clear capacity-exceeded failure.
+        public var maxTotalEntries: Int
 
         public init(
             backoff: RetryBackoffPolicy = .init(),
             maxAttempts: Int = 10,
-            maxAge: Duration = .seconds(5 * 24 * 3600)
+            maxAge: Duration = .seconds(5 * 24 * 3600),
+            maxTotalEntries: Int = 10_000
         ) {
             self.backoff = backoff
             self.maxAttempts = maxAttempts
             self.maxAge = maxAge
+            self.maxTotalEntries = maxTotalEntries
         }
 
         /// Mechanically classifies a non-2yz/non-permanent `SMTPReply` into
@@ -171,6 +199,16 @@ public actor DirectMXRetryQueue {
     /// practical" efficiency instruction).
     private var currentSleepTarget: Date?
     private var isShutDown = false
+    /// FIX #3 regression-test instrumentation only (concurrency +
+    /// SMTP-protocol reviews): incremented once per `processDueEntries()`
+    /// call, regardless of whether any entry actually turned out to be
+    /// due. A leaked zombie loop task (the bug this counter exists to
+    /// make observable) wakes and calls `processDueEntries()` on its own,
+    /// independent schedule -- indistinguishable from the legitimate
+    /// loop's own calls except by counting how many happen in total.
+    /// Not `public` -- read via `@testable import` from
+    /// `DirectMXRetryQueueTests`.
+    private(set) var processDueEntriesInvocationCountForTesting = 0
 
     /// - Parameters:
     ///   - redeliver: Attempts delivery exactly once more for the
@@ -217,6 +255,19 @@ public actor DirectMXRetryQueue {
     ) async -> Bool {
         guard case .queuedForRetry(let nextAttempt, let attempt, let last) = outcome else { return false }
         guard !isShutDown else { return false }
+        // FIX #6 (LOW-MEDIUM security, milestone security review): checked
+        // before anything else is allocated for this entry -- see
+        // `Configuration.maxTotalEntries`'s doc comment for why this cap
+        // exists and why exceeding it is reported as a terminal `.failed`
+        // outcome rather than silently dropped or left to grow the
+        // dictionary without bound.
+        guard entries.count < configuration.maxTotalEntries else {
+            await reportTerminal(
+                recipients: recipients,
+                outcome: .failed(DirectMXRetryQueueError.queueAtCapacity(maxTotalEntries: configuration.maxTotalEntries))
+            )
+            return false
+        }
         let firstQueuedAt = Date()
         if configuration.isPastCeiling(attempt: attempt, firstQueuedAt: firstQueuedAt) {
             // Defensive: only reachable if a caller enqueues an
@@ -296,8 +347,12 @@ public actor DirectMXRetryQueue {
     ///-arrived earlier entry instead of oversleeping until its stale
     /// target. `Task.sleep`'s `CancellationError` from this restart is
     /// indistinguishable, at the point it's thrown, from a `shutdown()`-
-    /// triggered cancellation; `runLoop` disambiguates by checking
-    /// `isShutDown` (not `Task.isCancelled`) once the sleep returns.
+    /// triggered cancellation; `runLoop` doesn't need to tell them apart --
+    /// FIX #3 made it check `Task.isCancelled` in addition to `isShutDown`
+    /// immediately after the sleep, so *either* cause makes that exact
+    /// task instance exit rather than only `shutdown()` doing so (which
+    /// previously let a nudge-cancelled task fall through and keep running
+    /// as a permanent duplicate of the replacement task started below).
     private func nudgeLoop(forCandidate candidate: Date) {
         guard !isShutDown else { return }
         guard loopTask != nil else {
@@ -335,18 +390,44 @@ public actor DirectMXRetryQueue {
                 try await Task.sleep(for: .seconds(interval))
             } catch {
                 // Cancelled -- either `shutdown()` or a `nudgeLoop` restart
-                // for an earlier-arriving entry. `isShutDown`, checked at
-                // the top of the next iteration below, disambiguates;
-                // either way there's nothing further to do in this catch
-                // block but let the loop repeat (or exit).
+                // for an earlier-arriving entry. Nothing to do in the
+                // `catch` block itself; the check below (not just
+                // `isShutDown`) is what actually disambiguates and exits
+                // promptly on either.
             }
             currentSleepTarget = nil
-            guard !isShutDown else { return }
+            // FIX #3 (concurrency + SMTP-protocol reviews, independently
+            // converged on the same bug): a *nudge*-triggered cancellation
+            // (`nudgeLoop` cancelling this exact task instance to start a
+            // fresh replacement for an earlier-arriving entry) must make
+            // *this* task instance exit immediately -- previously only
+            // `isShutDown` was checked here, so a nudge-cancelled task's
+            // `Task.sleep` threw, was silently swallowed by the `catch`
+            // above, and this loop fell straight through into
+            // `processDueEntries()` and back around `while !isShutDown`,
+            // continuing to run as an independent, permanently-live
+            // duplicate of the replacement task `nudgeLoop` had already
+            // started. Every subsequent nudge that raced ahead of an
+            // in-flight sleep (routine under real traffic -- different
+            // domains' backoffs land at different times) spawned another
+            // such zombie, an unbounded task leak, and made `shutdown()`'s
+            // single `loopTask?.cancel()` insufficient (it only ever
+            // reached the *current* reference, never any earlier zombies).
+            // `Task.isCancelled` is the correct signal here (not folded
+            // into the `catch` above) because it must also cover the rare
+            // case where `Task.sleep` happens to return normally in the
+            // same instant cancellation is requested -- cancellation of
+            // this specific task instance always means "stop, a
+            // replacement may already be running or the queue is
+            // shutting down," never "keep going regardless of how the
+            // sleep returned."
+            guard !isShutDown, !Task.isCancelled else { return }
             await processDueEntries()
         }
     }
 
     private func processDueEntries() async {
+        processDueEntriesInvocationCountForTesting += 1
         let now = Date()
         let due = entries.values.filter { $0.nextAttempt <= now }
         for entry in due {

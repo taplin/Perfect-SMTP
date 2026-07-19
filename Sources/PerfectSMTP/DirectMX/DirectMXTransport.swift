@@ -22,6 +22,20 @@ import NIOCore
 /// override surface in this phase (e.g. a domain known to require TLS vs.
 /// one that doesn't; that policy layer is Phase 4's MTA-STS/DANE scope, not
 /// this one).
+///
+/// **Security (FIX #2, milestone security review): this transport must not
+/// be exposed to untrusted recipient input without SSRF-class address
+/// filtering enabled** -- `allowPrivateAddresses` defaults to `false`
+/// (filtering on) specifically because `DirectMXTransport` resolves and
+/// dials whatever MX/A/AAAA records a destination domain publishes. A
+/// caller that lets an untrusted party influence the recipient domain (a
+/// web app's "share via email" feature, a future Lasso `email_send`
+/// adapter, etc.) would otherwise let an attacker publish a record
+/// pointing at `127.0.0.1`, an RFC 1918 address, or other internal
+/// infrastructure and have this transport open a real TCP connection and
+/// run a full SMTP conversation against it. Leave `allowPrivateAddresses`
+/// at its default unless the caller's own equivalent protection is already
+/// in place, or this is a deliberate internal-relay-testing use case.
 public struct DirectMXConfig: Sendable {
     /// The port dialed on every resolved MX host. 25 (not 587/465) is
     /// correct here: this transport speaks MTA-to-MTA delivery, the
@@ -51,10 +65,28 @@ public struct DirectMXConfig: Sendable {
     /// become undeliverable until Phase 4 lands.
     public var tls: TLSMode
     public var ehloHostname: String
+    /// **Direct-MX-specific note (not a Phase-1 concern):** `RelayTransport`
+    /// owns one pool per configured relay, so `maxTotal` is naturally a cap
+    /// on connections to that single destination. `DirectMXTransport`
+    /// shares **one** pool instance across every distinct destination
+    /// domain/MX host in a batch (see this type's own doc comment), so
+    /// `maxTotal` here is a hard global cap across *all* domains combined,
+    /// not per-domain -- a caller doing meaningful batch volume across many
+    /// domains should likely raise it above the Phase-1 default (32).
     public var pool: SMTPConnectionPool.Configuration
     public var connectTimeout: TimeAmount
     public var replyTimeout: Duration
     public var dataTerminationTimeout: Duration
+    /// FIX #2 (milestone security review): SSRF-class filtering is
+    /// default-**on** -- every resolved `DNSAddress` is checked against
+    /// `DNSAddress.isRoutable` (private/loopback/link-local/unique-local/
+    /// CGNAT ranges, see that property's doc comment) before this
+    /// transport ever dials it, and an address that fails the check is
+    /// dropped rather than connected to. Set `true` only for a deliberate
+    /// internal-relay-testing use case (e.g. a test harness or an
+    /// intentionally internal-only deployment) -- see this type's own doc
+    /// comment for the attack this default protects against.
+    public var allowPrivateAddresses: Bool
 
     public init(
         port: Int = 25,
@@ -63,7 +95,8 @@ public struct DirectMXConfig: Sendable {
         pool: SMTPConnectionPool.Configuration = .init(),
         connectTimeout: TimeAmount = .seconds(30),
         replyTimeout: Duration = .seconds(300),
-        dataTerminationTimeout: Duration = .seconds(600)
+        dataTerminationTimeout: Duration = .seconds(600),
+        allowPrivateAddresses: Bool = false
     ) {
         self.port = port
         self.tls = tls
@@ -72,6 +105,7 @@ public struct DirectMXConfig: Sendable {
         self.connectTimeout = connectTimeout
         self.replyTimeout = replyTimeout
         self.dataTerminationTimeout = dataTerminationTimeout
+        self.allowPrivateAddresses = allowPrivateAddresses
     }
 }
 
@@ -88,6 +122,16 @@ public enum DirectMXError: Error, Sendable, Equatable {
     case noUsableMXHost(domain: String)
     /// A candidate host resolved to no usable A/AAAA address at all.
     case noUsableAddress(host: String)
+    /// FIX #2 (milestone security review): every A/AAAA address resolved
+    /// for `host` was filtered out as private/loopback/link-local/
+    /// unique-local/CGNAT (see `DNSAddress.isRoutable`) -- distinct from
+    /// `.noUsableAddress` (which means the resolver returned nothing at
+    /// all) specifically so this is diagnosable as "this host published an
+    /// address this transport refuses to dial" rather than a mysterious
+    /// connection failure indistinguishable from a genuine DNS/network
+    /// problem. Never thrown when `DirectMXConfig.allowPrivateAddresses`
+    /// is `true`.
+    case allResolvedAddressesFilteredAsPrivate(host: String)
 }
 
 /// A `SMTPTransport` that resolves MX records itself and delivers directly
@@ -265,7 +309,7 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         do {
             hosts = try await resolveMXHosts(domain: domain, resolver: resolver)
         } catch let resolveError as DNSResolver.ResolveError {
-            let outcome = classify(resolveError: resolveError, domain: domain)
+            let outcome = classify(resolveError: resolveError, domain: domain, retryQueueConfiguration: retryQueueConfiguration)
             return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
         } catch {
             return recipients.map { DeliveryResult(recipient: $0, outcome: .failed(error)) }
@@ -300,11 +344,24 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     /// `pool.withConnection`, `SMTPError.circuitOpen`, a mid-conversation
     /// `SMTPConnectionError`) propagates unchanged, which is exactly what
     /// signals "connection failure, fall back" to the caller.
+    ///
+    /// FIX (milestone architecture + SMTP-protocol reviews, converged on
+    /// the same root cause): "handled, don't fall back to another host"
+    /// and "the connection itself is still healthy" are **not** the same
+    /// question -- a mid-DATA disconnect (`.ambiguous`) or a `421`
+    /// ("closing the transmission channel," RFC 5321 §4.2.1) both return
+    /// normally from this method (correctly -- neither should trigger
+    /// MX-host fallback) but must **not** be treated as `healthy: true` by
+    /// the pool, or a host that's flaky specifically in that window would
+    /// never trip the circuit breaker. `isHealthy:` (passed to
+    /// `pool.withConnection` below) is what closes that gap -- see
+    /// `SMTPConnectionPool.deliveryResultsIndicateHealthyConnection`'s doc
+    /// comment.
     private static func attemptOnHost(
         key: SMTPConnectionPool.Key, recipients: [String], mailFrom: ReversePath, message: SignedMessage,
         pool: SMTPConnectionPool, retryQueueConfiguration: DirectMXRetryQueue.Configuration
     ) async throws -> [DeliveryResult] {
-        try await pool.withConnection(to: key) { connection in
+        try await pool.withConnection(to: key, isHealthy: SMTPConnectionPool.deliveryResultsIndicateHealthyConnection) { connection in
             let envelope = try SMTPEnvelope(mailFrom: mailFrom, recipients: recipients, size: message.estimatedSize)
             do {
                 return try await connection.sendMessage(envelope, message)
@@ -345,7 +402,14 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         }
     }
 
-    private static func classify(resolveError: DNSResolver.ResolveError, domain: String) -> DeliveryResult.Outcome {
+    /// - Parameters:
+    ///   - retryQueueConfiguration: Threaded through only for `.timeout`/
+    ///     `.serverFailure`/`.noNameserversConfigured` (see that `case`'s
+    ///     comment below) -- everything else this method classifies is
+    ///     permanent and never touches a backoff policy at all.
+    private static func classify(
+        resolveError: DNSResolver.ResolveError, domain: String, retryQueueConfiguration: DirectMXRetryQueue.Configuration
+    ) -> DeliveryResult.Outcome {
         switch resolveError {
         case .nullMX:
             // RFC 7505: an explicit, authoritative "this domain does not
@@ -366,13 +430,35 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
             // exhaustiveness / defense-in-depth in case that call site's
             // behavior changes.
             return .permanentlyFailed(SMTPReply(code: 550, lines: ["5.1.2 Domain \(domain) has no MX records"]))
-        case .timeout, .malformedResponse, .serverFailure, .cnameLoop, .noNameserversConfigured:
-            // A genuine DNS-infrastructure problem, not a statement about
-            // whether the domain accepts mail -- surfaced as `.failed`
-            // (not auto-retried by this phase's retry queue, which only
-            // schedules SMTP-reply-classified `.queuedForRetry` outcomes;
-            // see `DirectMXRetryQueue`'s doc comments) rather than guessed
-            // to be permanent or transient.
+        case .timeout, .serverFailure, .noNameserversConfigured:
+            // Milestone review finding (architecture + SMTP-protocol
+            // reviews, independently flagged): a genuine DNS-*infrastructure*
+            // problem (a resolver that didn't answer in time, an
+            // authoritative server returning SERVFAIL/REFUSED, or this
+            // process having no nameservers configured at all) is plausibly
+            // transient -- a network blip, a resolver restart -- and says
+            // nothing about whether `domain` itself accepts mail. Treating
+            // it as immediately, permanently `.failed` (the previous
+            // behavior) discarded that distinction; routed through the
+            // retry queue instead, via a synthesized `SMTPReply` (RFC 3463
+            // enhanced status `4.4.3`, "directory server failure" -- the
+            // conventional code real MTAs use for exactly this: a
+            // temporary DNS lookup failure) so `retryQueueConfiguration`'s
+            // already-configured backoff machinery classifies it uniformly
+            // with every other transient outcome (a `450`-class reply
+            // lands on the same conservative `greylist` backoff duration
+            // Phase 1's own RCPT/DATA-phase rejections use for an
+            // equivalent-severity failure).
+            let reply = SMTPReply(code: 450, lines: ["4.4.3 Temporary DNS resolution failure for \(domain) (\(resolveError))"])
+            return retryQueueConfiguration.classify(reply, attempt: 1)
+        case .malformedResponse, .cnameLoop:
+            // Unlike the infrastructure failures above, these indicate the
+            // *queried* nameserver actually responded but with something
+            // this codec can't safely use (a malformed wire-format message,
+            // or a CNAME chain that couldn't be safely followed to
+            // completion) -- not obviously transient the way a timeout or
+            // SERVFAIL is, so left exactly as before: `.failed`, not
+            // auto-retried, not guessed to be permanent either.
             return .failed(resolveError)
         }
     }
@@ -457,7 +543,26 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         retryQueueConfiguration: DirectMXRetryQueue.Configuration
     ) -> @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection {
         { key in
-            let addresses = try await resolver.resolveAddresses(hostname: key.host)
+            let resolvedAddresses = try await resolver.resolveAddresses(hostname: key.host)
+            // FIX #2 (milestone security review, SSRF-class filtering):
+            // drop every address in a private/loopback/link-local/
+            // unique-local/CGNAT range before ever dialing it -- see
+            // `DNSAddress.isRoutable`'s doc comment for the exact ranges
+            // and `DirectMXConfig.allowPrivateAddresses`'s doc comment for
+            // the attack this protects against and the documented
+            // opt-out.
+            let addresses = config.allowPrivateAddresses ? resolvedAddresses : resolvedAddresses.filter(\.isRoutable)
+            guard !addresses.isEmpty else {
+                // Distinguish "the resolver returned nothing at all" from
+                // "every candidate was filtered as private/reserved" --
+                // the latter is a real, actionable security-relevant
+                // outcome (this host published an address this transport
+                // refuses to dial), not a mysterious connection failure.
+                if !config.allowPrivateAddresses, !resolvedAddresses.isEmpty {
+                    throw DirectMXError.allResolvedAddressesFilteredAsPrivate(host: key.host)
+                }
+                throw DirectMXError.noUsableAddress(host: key.host)
+            }
             var lastError: any Error = DirectMXError.noUsableAddress(host: key.host)
             for address in addresses {
                 do {

@@ -35,7 +35,14 @@ struct DirectMXRealSocketTests {
         )
         let transport = DirectMXTransport(
             resolver: resolver,
-            config: DirectMXConfig(port: server.port, tls: .none),
+            // `allowPrivateAddresses: true` -- FIX #2's SSRF-class filter
+            // defaults to rejecting `127.0.0.1` (loopback), which is
+            // exactly the address this test's fake server listens on.
+            // This is the documented opt-out for a deliberate
+            // internal-relay-testing use case (see `DirectMXConfig
+            // .allowPrivateAddresses`'s doc comment) -- without it, this
+            // test's own address would be filtered before ever dialing.
+            config: DirectMXConfig(port: server.port, tls: .none, allowPrivateAddresses: true),
             group: group
         )
 
@@ -52,6 +59,53 @@ struct DirectMXRealSocketTests {
             Issue.record("expected .delivered through the real production dialer, got \(results[0].outcome)")
             return
         }
+    }
+
+    /// FIX #2 (milestone security review, SSRF-class filtering): the
+    /// counterpart to the test above -- same real, reachable loopback
+    /// listener, same resolved `127.0.0.1` address, but *without*
+    /// `allowPrivateAddresses: true`. The listener being genuinely
+    /// reachable is what makes this decisive: if the filter weren't
+    /// actually gating the dial, this would succeed exactly like the test
+    /// above. It must instead fail with the new distinct error, proving
+    /// the connection was never attempted at all.
+    @Test func productionDialerRefusesToDialARealReachableLoopbackListenerWithoutTheOptOut() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let server = try await AcceptingFakeSMTPServer.start(group: group)
+
+        let resolver = FakeMXResolver(
+            mxRecords: ["ssrf.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.ssrf.example")]],
+            addresses: ["mx.ssrf.example": [.v4([127, 0, 0, 1])]]
+        )
+        // Deliberately the default config -- `allowPrivateAddresses` left
+        // at `false` even though `server` is genuinely listening and
+        // reachable at this address/port.
+        let transport = DirectMXTransport(
+            resolver: resolver,
+            config: DirectMXConfig(port: server.port, tls: .none),
+            group: group
+        )
+
+        let envelope = try SMTPEnvelope(mailFrom: .address("from@sender.example"), recipients: ["rcpt@ssrf.example"])
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\nFrom: from@sender.example\r\n\r\nbody".utf8))
+
+        let results = try await transport.send(envelope, message)
+        await transport.shutdown()
+        try await server.channel.close()
+        try await group.shutdownGracefully()
+
+        #expect(results.count == 1)
+        guard case .failed(let error) = results[0].outcome else {
+            Issue.record("expected .failed (the loopback address filtered as private), got \(results[0].outcome)")
+            return
+        }
+        guard let directMXError = error as? DirectMXError,
+              case .allResolvedAddressesFilteredAsPrivate(let host) = directMXError
+        else {
+            Issue.record("expected DirectMXError.allResolvedAddressesFilteredAsPrivate, got \(error)")
+            return
+        }
+        #expect(host == "mx.ssrf.example")
     }
 }
 

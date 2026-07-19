@@ -192,11 +192,44 @@ public actor SMTPConnectionPool {
 
     // MARK: - Public API
 
-    public func withConnection<R: Sendable>(to key: Key, _ body: (SMTPConnection) async throws -> R) async throws -> R {
+    /// - Parameters:
+    ///   - isHealthy: Milestone review finding (architecture + SMTP-
+    ///     protocol reviews, independently converged on the same root
+    ///     cause): a mail transaction can complete and `body` can return
+    ///     *normally* -- no thrown error at all -- even though the
+    ///     connection it ran over is no longer safe to reuse. Both
+    ///     `RelayTransport.sendMessage`'s and `DirectMXTransport
+    ///     .attemptOnHost`'s message-level rejection handling deliberately
+    ///     *return* (never throw) an outcome like `.ambiguous` (a
+    ///     mid-DATA disconnect -- plan §4.8's point of no return: the peer
+    ///     may or may not have accepted the message, and the socket may
+    ///     already be half-closed) or a `421` reply (RFC 5321 §4.2.1: the
+    ///     peer's own explicit "service unavailable, closing the
+    ///     transmission channel"), precisely so a message-level rejection
+    ///     doesn't get mistaken for a connection-level failure by the
+    ///     caller's own host-fallback logic. But that same "return, don't
+    ///     throw" design meant this method previously had no way to learn
+    ///     that the connection died (or was told to die) anyway -- every
+    ///     normal return of `body` was unconditionally treated as
+    ///     `healthy: true`, so a connection that just disconnected
+    ///     mid-DATA or received a `421` never fed the circuit breaker's
+    ///     failure count and was never proactively closed (left to a race
+    ///     on `channel.isActive` instead -- see `release`). `isHealthy`
+    ///     closes that gap: it inspects `body`'s actual return value and
+    ///     decides. Defaults to `{ _ in true }` so any caller that doesn't
+    ///     supply one keeps this method's original behavior exactly
+    ///     (`R == Void`, the pool's own tests, etc.) -- callers whose `R`
+    ///     is `[DeliveryResult]` should pass
+    ///     `SMTPConnectionPool.deliveryResultsIndicateHealthyConnection`.
+    public func withConnection<R: Sendable>(
+        to key: Key,
+        isHealthy: (R) -> Bool = { _ in true },
+        _ body: (SMTPConnection) async throws -> R
+    ) async throws -> R {
         let connection = try await checkout(key)
         do {
             let result = try await body(connection)
-            release(key, connection: connection, healthy: true)
+            release(key, connection: connection, healthy: isHealthy(result))
             return result
         } catch {
             release(key, connection: connection, healthy: false)
@@ -380,5 +413,50 @@ public actor SMTPConnectionPool {
 
     private func recordSuccess(_ key: Key) {
         breaker[key] = .closed(consecutiveFailures: 0)
+    }
+}
+
+// MARK: - `[DeliveryResult]`-shaped `withConnection` health heuristic
+
+extension SMTPConnectionPool {
+    /// The `isHealthy` argument every `withConnection(to:isHealthy:_:)`
+    /// caller whose `body` returns `[DeliveryResult]` should pass
+    /// (`RelayTransport.send`, `DirectMXTransport.attemptOnHost`) -- the
+    /// shared layer both transports' message-level-rejection handling
+    /// funnels through, so this fix applies uniformly rather than being
+    /// special-cased in just one of them (both share this same
+    /// `withConnection`-wrapping shape: catch/return a message-level
+    /// rejection as data instead of a thrown error, exactly the pattern
+    /// that made the connection's actual post-transaction health invisible
+    /// to `release` before this fix).
+    ///
+    /// A connection is *not* healthy when any recipient's outcome is:
+    ///   - `.ambiguous` -- a mid-DATA disconnect (plan §4.8's point of no
+    ///     return); the connection may already be half-closed and must
+    ///     never be assumed alive.
+    ///   - `.queuedForRetry` carrying a `421` reply (RFC 5321 §4.2.1's
+    ///     "service unavailable, closing the transmission channel") --
+    ///     the peer's own explicit statement that it is tearing the
+    ///     connection down, regardless of which phase (MAIL FROM, RCPT,
+    ///     or the DATA-terminating reply) it arrived in.
+    /// Every other outcome (`.delivered`, `.permanentlyFailed`, any other
+    /// `.queuedForRetry`, `.expired`, `.failed`) leaves the connection
+    /// itself unaffected -- a `550` from a live, correctly-responding peer
+    /// is a message-level rejection, not a connection problem.
+    public static func deliveryResultsIndicateHealthyConnection(_ results: [DeliveryResult]) -> Bool {
+        !results.contains { $0.outcome.indicatesConnectionMayBeUnhealthy }
+    }
+}
+
+private extension DeliveryResult.Outcome {
+    var indicatesConnectionMayBeUnhealthy: Bool {
+        switch self {
+        case .ambiguous:
+            return true
+        case .queuedForRetry(_, _, let last):
+            return last.code == 421
+        case .delivered, .permanentlyFailed, .expired, .failed:
+            return false
+        }
     }
 }
