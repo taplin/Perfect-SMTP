@@ -29,12 +29,83 @@ struct SMTPMailerBatchFanoutTests {
             return message
         }
 
-        let results = try await mailer.send(messages, envelopeFrom: .address("bounce@example.com"))
+        let results = await mailer.send(messages, envelopeFrom: .address("bounce@example.com"))
 
         #expect(results.count == 250)
         #expect(await tracker.maxObserved <= cap)
         #expect(await tracker.maxObserved > 0) // sanity: fan-out actually happened concurrently
         #expect(await tracker.totalSends == 250)
+    }
+
+    // MARK: - FIX #5: a single message's transport-level throw must not
+    // cancel/discard the rest of the batch.
+
+    @Test func middleMessageTransportFailureDoesNotDiscardTheOtherMessagesResults() async throws {
+        // A transport that throws (a connection-level failure, not a
+        // per-recipient rejection) for exactly one message in the batch --
+        // identified by its sole recipient's address -- and succeeds
+        // normally for every other message. Before FIX #5, `send`'s use of
+        // `withThrowingTaskGroup` meant this single throw would cancel
+        // every other in-flight/pending child and propagate out of the
+        // whole call, discarding the two good messages' results entirely.
+        let transport = SelectivelyFailingTransport(failingRecipient: "bad@example.com")
+        let mailer = SMTPMailer(transport: transport, configuration: .init(maxInFlightBatchSends: 8))
+
+        func message(_ recipient: String) -> EmailMessage {
+            var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+            message.to = [EmailAddress(address: recipient)]
+            message.textBody = "hello"
+            return message
+        }
+
+        let messages = [
+            message("good1@example.com"),
+            message("bad@example.com"),
+            message("good2@example.com"),
+        ]
+
+        let results = await mailer.send(messages, envelopeFrom: .address("bounce@example.com"))
+
+        // All three messages are represented -- the middle failure didn't
+        // erase the other two.
+        #expect(results.count == 3)
+
+        let good1 = results.first { $0.recipient == "good1@example.com" }
+        let good2 = results.first { $0.recipient == "good2@example.com" }
+        let bad = results.first { $0.recipient == "bad@example.com" }
+
+        guard let good1, case .delivered = good1.outcome else {
+            Issue.record("expected good1@example.com delivered, got \(String(describing: good1?.outcome))")
+            return
+        }
+        guard let good2, case .delivered = good2.outcome else {
+            Issue.record("expected good2@example.com delivered, got \(String(describing: good2?.outcome))")
+            return
+        }
+        guard let bad, case .failed = bad.outcome else {
+            Issue.record("expected bad@example.com to surface as .failed, got \(String(describing: bad?.outcome))")
+            return
+        }
+    }
+}
+
+/// A `SMTPTransport` that throws a plain transport-level error (not a
+/// per-recipient `DeliveryResult` rejection) whenever the envelope's
+/// recipients include `failingRecipient`, and otherwise succeeds normally
+/// -- used to simulate a connection/envelope-level failure for exactly one
+/// message in a batch (FIX #5's regression scenario).
+private struct SelectivelyFailingTransport: SMTPTransport {
+    struct SimulatedTransportFailure: Error, Sendable {}
+
+    let failingRecipient: String
+
+    func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
+        guard !envelope.recipients.contains(failingRecipient) else {
+            throw SimulatedTransportFailure()
+        }
+        return envelope.recipients.map {
+            DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"])))
+        }
     }
 }
 

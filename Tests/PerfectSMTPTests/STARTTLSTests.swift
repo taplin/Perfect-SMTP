@@ -13,6 +13,43 @@
 //  inserted, no throw) -- the EHLO re-issue with capabilities reset is
 //  Phase B's job, covered separately in `SMTPConnectionStateMachineTests`.
 //
+//  KNOWN BLIND SPOT (milestone review finding, FIX #1) -- READ BEFORE
+//  TRUSTING THIS SUITE FOR AUTOREAD/READ-INTEREST BEHAVIOR:
+//
+//  `EmbeddedChannel` does not model real kqueue/epoll read-interest
+//  registration at all -- calling
+//  `channel.setOption(ChannelOptions.autoRead, value: false)` on an
+//  `EmbeddedChannel` records the option's value but has no effect on
+//  whether `writeInbound`-delivered bytes are ever seen by the pipeline;
+//  every `writeInbound` call unconditionally delivers its bytes to
+//  `channelRead`, `autoRead` setting notwithstanding. This is exactly why
+//  a real bug shipped and passed this whole suite once: the original
+//  `handlePreTLSEHLOReply` disabled `autoRead` immediately after writing
+//  `STARTTLS`, *before* the server's `220` reply had arrived. Against a
+//  real `NIOPosix` socket, that synchronously deregisters read interest at
+//  the kqueue/epoll level on the `true -> false` transition, so the
+//  already-in-flight `220` bytes sit unread in the kernel socket buffer
+//  forever -- every real STARTTLS negotiation hangs. Against
+//  `EmbeddedChannel`, the next `writeInbound(ByteBuffer(string: "220
+//  ...\r\n"))` call in `primeUpToSTARTTLSReply`/the tests below delivers
+//  the `220` to `channelRead` regardless, so the hang was completely
+//  invisible here.
+//
+//  The fix (moving the `autoRead = false` call into `handleStartTLSReply`,
+//  synchronous with receiving the `220`) is exercised by this suite's
+//  normal assertions -- correct STARTTLS *sequencing* and the
+//  injection-rejection behavior are real regressions this suite catches.
+//  What it can NOT catch, by construction, is a regression that
+//  reintroduces a premature `autoRead = false` call (or any other
+//  real-socket-only read-interest bug): `EmbeddedChannel` would still
+//  pass. If you are refactoring this fencing logic, do not trust a green
+//  `STARTTLSTests` run alone -- verify by tracing exactly when
+//  `setOption(autoRead, ...)` is called relative to when the `220` reply
+//  is written into the pipeline, or exercise it against a real `NIOPosix`
+//  `ServerBootstrap`/`ClientBootstrap` pair (a full real-socket regression
+//  test was judged too large an undertaking for this fix pass -- this
+//  comment is the documented mitigation in its place).
+//
 
 import NIOCore
 import NIOEmbedded
@@ -62,7 +99,16 @@ struct STARTTLSTests {
             Issue.record("expected the bootstrap promise to have failed")
             return
         }
-        if case .some(.starttlsInjection) = error as? SMTPError { } else { Issue.record("expected .starttlsInjection, got \(error)") }
+        guard case .some(.starttlsInjection(let underlying)) = error as? SMTPError else {
+            Issue.record("expected .starttlsInjection, got \(error)")
+            return
+        }
+        // Same-buffer path: detected directly by the decoder's own
+        // residual-bytes check (`handleStartTLSReply`'s guard), not
+        // surfaced via `errorCaught` -- no underlying error to carry
+        // (milestone review finding, `SMTPError.starttlsInjection`'s new
+        // associated value).
+        #expect(underlying == nil)
     }
 
     @Test func separateBufferInjectionIsRejected() throws {
@@ -88,7 +134,15 @@ struct STARTTLSTests {
             Issue.record("expected the bootstrap promise to have failed")
             return
         }
-        if case .some(.starttlsInjection) = error as? SMTPError { } else { Issue.record("expected .starttlsInjection, got \(error)") }
+        guard case .some(.starttlsInjection(let underlying)) = error as? SMTPError else {
+            Issue.record("expected .starttlsInjection, got \(error)")
+            return
+        }
+        // Separate-buffer path: the garbage bytes reach `NIOSSLClientHandler`
+        // as bogus TLS record data, failing the handshake with a genuine
+        // NIOSSL error -- surfaced via `errorCaught`, so this case DOES
+        // carry a real underlying error (milestone review finding).
+        #expect(underlying != nil)
         #expect(!built.channel.isActive)
     }
 
@@ -112,6 +166,22 @@ struct STARTTLSTests {
         // clean-upgrade path, not an injection.
         #expect(immediateOutcome(built.promise.futureResult) == nil)
         #expect(built.channel.isActive)
+    }
+
+    // MARK: - IP-literal host / no-SNI fallback (lowest priority, milestone
+    // security review: verified safe -- `serverHostname: nil` still
+    // triggers full certificate verification including IP-SAN checking
+    // against the real peer address, it is not a verification bypass).
+    // Full handshake-level testing needs a live socket/real certificate and
+    // is impractical here; this confirms the narrower, still-useful claim
+    // that construction itself doesn't throw for an IP-literal host.
+
+    @Test func makeSSLHandlerDoesNotThrowForAnIPLiteralHost() throws {
+        _ = try SMTPBootstrap.makeSSLHandler(host: "203.0.113.10", configuration: .makeClientConfiguration())
+    }
+
+    @Test func makeSSLHandlerDoesNotThrowForAnIPv6LiteralHost() throws {
+        _ = try SMTPBootstrap.makeSSLHandler(host: "2001:db8::1", configuration: .makeClientConfiguration())
     }
 }
 

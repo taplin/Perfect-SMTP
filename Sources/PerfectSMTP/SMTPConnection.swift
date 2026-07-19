@@ -26,6 +26,17 @@ public enum SMTPConnectionError: Error, Sendable, Equatable {
     case channelClosedByPeer
     /// A `334` continuation reply's text wasn't valid base64.
     case malformedSASLChallenge
+    /// FIX #4 (plan §7, required, milestone architecture review): no reply
+    /// arrived within the configured timeout. RFC 5321 §4.5.3.2 specifies
+    /// minimum client timeouts per command phase -- without enforcing one,
+    /// a hung/black-holed remote server leaves the awaiting task suspended
+    /// forever, and since the connection never becomes "idle" (it's
+    /// mid-transaction), the pool's idle-eviction path never reaps it
+    /// either, silently shrinking `maxPerHost`'s effective capacity toward
+    /// zero over time. Flows through `SMTPConnectionPool.withConnection`'s
+    /// existing catch path exactly like any other thrown error, marking the
+    /// connection unhealthy (closed, not returned to idle) via `release`.
+    case replyTimedOut
 }
 
 /// The live, TLS-ready connection's async conversation surface.
@@ -54,8 +65,28 @@ public final class SMTPConnection: @unchecked Sendable {
     private let outbound: NIOAsyncChannelOutboundWriter<SMTPCommand>
     public private(set) var capabilities: Capabilities
     public let ehloHostname: String
+    /// FIX #4: per-command timeout (RFC 5321 §4.5.3.2's general minimum is
+    /// 5 minutes; 300s here matches that). Applied uniformly across
+    /// `nextReply()`/`write()` as a documented simplification -- threading
+    /// a phase-specific value through every call site was judged too
+    /// invasive for this fix pass, except for the one place it matters most
+    /// (see `dataTerminationTimeout` below).
+    private let replyTimeout: Duration
+    /// FIX #4's phase-specific exception: RFC 5321 §4.5.3.2 specifies a
+    /// *longer* minimum timeout (10 minutes) specifically for the client
+    /// waiting on the final reply after the DATA-terminating `<CRLF>.<CRLF>`
+    /// -- the server may be doing real work (spooling/scanning/reinjecting
+    /// a large message) that legitimately takes longer than an ordinary
+    /// command round-trip. Used only in `sendBodyAndFinalize`'s final-reply
+    /// wait; every other command uses `replyTimeout`.
+    private let dataTerminationTimeout: Duration
 
-    public init(asyncChannel: NIOAsyncChannel<SMTPReply, SMTPCommand>, ehloHostname: String) {
+    public init(
+        asyncChannel: NIOAsyncChannel<SMTPReply, SMTPCommand>,
+        ehloHostname: String,
+        replyTimeout: Duration = .seconds(300),
+        dataTerminationTimeout: Duration = .seconds(600)
+    ) {
         self.channel = asyncChannel.channel
         // Intentional use of the unscoped, deprecated `.inbound`/`.outbound`
         // accessors -- see this type's doc comment for why
@@ -67,22 +98,56 @@ public final class SMTPConnection: @unchecked Sendable {
         self.outbound = asyncChannel.outbound
         self.capabilities = Capabilities()
         self.ehloHostname = ehloHostname
+        self.replyTimeout = replyTimeout
+        self.dataTerminationTimeout = dataTerminationTimeout
     }
 
     /// Reads the next reply, or throws if the connection closed
     /// mid-conversation (plan §4.3's "mid-conversation disconnect" —
     /// `NIOAsyncChannel`'s inbound sequence terminating on channel close
     /// surfaces here as a normal thrown error by construction, no special
-    /// handling needed).
+    /// handling needed), or throws `.replyTimedOut` if `replyTimeout`
+    /// elapses first (FIX #4).
     public func nextReply() async throws -> SMTPReply {
+        try await raceAgainstTimeout(replyTimeout) { try await self.rawNextReply() }
+    }
+
+    /// The actual, un-timed-out read off the inbound iterator -- factored
+    /// out so `sendBodyAndFinalize` can race it against
+    /// `dataTerminationTimeout` instead of `nextReply()`'s `replyTimeout`.
+    private func rawNextReply() async throws -> SMTPReply {
         guard let reply = try await iterator.next() else {
             throw SMTPConnectionError.channelClosedByPeer
         }
         return reply
     }
 
+    /// Races `operation` against `timeout`, matching the shape of
+    /// `LocalMTATransport.raceTerminationAgainstTimeout` for consistency
+    /// (FIX #4's explicit instruction to reuse that pattern). The loser is
+    /// cancelled; `withThrowingTaskGroup` itself blocks this function's
+    /// return on that cancellation actually completing, same as the
+    /// existing precedent.
+    private func raceAgainstTimeout<T: Sendable>(
+        _ timeout: Duration,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { race in
+            race.addTask { try await operation() }
+            race.addTask {
+                try await Task.sleep(for: timeout)
+                throw SMTPConnectionError.replyTimedOut
+            }
+            defer { race.cancelAll() }
+            guard let result = try await race.next() else {
+                throw SMTPConnectionError.replyTimedOut
+            }
+            return result
+        }
+    }
+
     public func write(_ command: SMTPCommand) async throws {
-        try await outbound.write(command)
+        try await raceAgainstTimeout(replyTimeout) { try await self.outbound.write(command) }
     }
 
     public func writeLine(_ line: String) async throws {
@@ -276,10 +341,16 @@ public final class SMTPConnection: @unchecked Sendable {
         try await write(.raw(DotStuffing.encode(message.rfc5322)))
         // The point of no return (plan §4.8): after the DATA payload is
         // sent, before the final reply arrives. A failure in this exact
-        // window is `.ambiguous` and must never be auto-retried.
+        // window is `.ambiguous` and must never be auto-retried -- this
+        // includes a `.replyTimedOut` (FIX #4): a timeout waiting on the
+        // terminating reply is exactly as ambiguous as any other failure
+        // here, since the message may or may not have actually been
+        // accepted. Uses `dataTerminationTimeout` (not `nextReply()`'s
+        // ordinary `replyTimeout`) per RFC 5321 §4.5.3.2's longer minimum
+        // for this specific wait.
         let finalOutcome: DeliveryResult.Outcome
         do {
-            let finalReply = try await nextReply()
+            let finalReply = try await raceAgainstTimeout(dataTerminationTimeout) { try await self.rawNextReply() }
             finalOutcome = finalReply.replyClass == .positiveCompletion
                 ? .delivered(finalReply) : outcomeFor(finalReply)
         } catch {

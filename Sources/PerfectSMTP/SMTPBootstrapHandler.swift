@@ -74,7 +74,8 @@ public enum SMTPBootstrap {
                     // construction time.
                     let decoder = SMTPResponseDecoder()
                     try channel.pipeline.syncOperations.addHandler(
-                        ByteToMessageHandler(decoder), name: Names.decoder
+                        ByteToMessageHandler(decoder, maximumBufferSize: SMTPBootstrap.maximumReplyBufferSize),
+                        name: Names.decoder
                     )
                     try channel.pipeline.syncOperations.addHandler(SMTPCommandEncoder(), name: Names.encoder)
                     if tls == .implicit {
@@ -106,6 +107,19 @@ public enum SMTPBootstrap {
         static let encoder = "smtp-command-encoder"
     }
 
+    /// Cap on `ByteToMessageHandler`'s cumulation buffer for the SMTP reply
+    /// decoder (milestone security review finding, FIX #6): NIO defaults
+    /// `maximumBufferSize` to `nil` (unbounded), so a malicious/compromised
+    /// server sending one arbitrarily long line with no CRLF would otherwise
+    /// grow the cumulation buffer without limit -- a DoS vector that matters
+    /// specifically because `TLSMode.none` (plaintext relay on a trusted
+    /// network, per `RelayTransport`'s doc comment) and any relay that later
+    /// turns hostile are both in scope before TLS-verification-driven trust
+    /// even applies. SMTP replies are conventionally short (a handful of
+    /// lines under a few hundred bytes each); 64KB is generous headroom for
+    /// any real multiline EHLO/reply while being well short of unbounded.
+    static let maximumReplyBufferSize = 64 * 1024
+
     static func makeSSLHandler(host: String, configuration: TLSConfiguration) throws -> NIOSSLClientHandler {
         let context = try NIOSSLContext(configuration: configuration)
         do {
@@ -113,8 +127,18 @@ public enum SMTPBootstrap {
         } catch {
             // `host` failed SNI hostname validation (e.g. it's a bare IP
             // address, which NIOSSL's SNI validator rejects outright per
-            // RFC 6066 §3) -- fall back to no SNI rather than failing the
-            // whole connection over a cosmetic handshake extension.
+            // RFC 6066 §3) -- fall back to no SNI. This is NOT a
+            // verification bypass: `serverHostname: nil` only disables the
+            // SNI *extension* sent during the handshake (a hint some
+            // servers use for virtual hosting); it does not disable
+            // certificate verification. NIOSSL still performs full
+            // certificate-chain validation and still checks the peer's
+            // certificate against the real connection address -- for an
+            // IP-literal host specifically, that means verifying an
+            // iPAddress `subjectAltName` entry (RFC 6125 §6.4.2/RFC 5280)
+            // against the actual peer IP, exactly the check that would
+            // otherwise catch a MITM presenting the wrong certificate.
+            // Confirmed safe by the security review.
             return try NIOSSLClientHandler(context: context, serverHostname: nil)
         }
     }
@@ -185,7 +209,10 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             // CVE-2026-41319-class injection this handler exists to catch.
             // In `.finished`/`.failed` it's simply a stray event on a
             // handler that should already be gone/inert; fail closed.
-            fail(context: context, .starttlsInjection)
+            // No underlying error exists here -- this is a plain logic
+            // check ("a reply arrived when none should have"), not
+            // something surfaced via `errorCaught`.
+            fail(context: context, .starttlsInjection(underlying: nil))
         }
     }
 
@@ -199,16 +226,10 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
                 context.fireUserInboundEventTriggered(event)
                 return
             }
-            let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
-            context.channel.setOption(ChannelOptions.autoRead, value: true).whenComplete { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .failure(let error):
-                    self.fail(context: boundContext.value, .connectionFailed(error))
-                case .success:
-                    self.finish(context: boundContext.value)
-                }
-            }
+            // `autoRead` was already re-enabled in `insertTLSAndFreshDecoder`
+            // (see that method's comment) -- nothing left to toggle here,
+            // just hand off to Phase B.
+            finish(context: context)
             return
         }
         context.fireUserInboundEventTriggered(event)
@@ -220,16 +241,32 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             return
         }
         // Any error surfacing in the fenced upgrade window -- whether the
-        // decoder's own `residualBytesOnRemoval` (same-buffer injection) or
-        // NIOSSL failing to parse injected plaintext as a TLS record
+        // decoder's own `residualBytesOnRemoval` (same-buffer injection,
+        // surfaced here via `context.fireErrorCaught` since
+        // `ByteToMessageHandler` routes decode-time errors through
+        // `errorCaught` rather than through `removeHandler`'s own promise)
+        // or NIOSSL failing to parse injected plaintext as a TLS record
         // (separate-buffer injection) -- is the same underlying violation.
-        fail(context: context, .starttlsInjection)
+        // Milestone review finding: distinguish the two so a genuine TLS
+        // handshake failure (expired cert, cipher mismatch, network reset)
+        // isn't indistinguishable from an actual injection attempt in
+        // logs/metrics. The same-buffer path's `DecoderError` carries no
+        // diagnostic value beyond the residual-bytes fact `.starttlsInjection`
+        // itself already captures -- pass `nil`. Every other error reaching
+        // here (a real NIOSSL/handshake failure, a connection-level error)
+        // has genuine diagnostic value -- pass it through.
+        let underlying: (any Error & Sendable)? = error is SMTPResponseDecoder.DecoderError ? nil : error
+        fail(context: context, .starttlsInjection(underlying: underlying))
     }
 
     // MARK: - State transitions
 
     private func handleGreeting(_ reply: SMTPReply, context: ChannelHandlerContext) {
-        guard reply.replyClass == .positiveCompletion else {
+        // RFC 5321 §3.1 requires exactly `220` for the initial greeting --
+        // not any `2yz`. Matches the stricter `reply.code == 220` check
+        // already used for the STARTTLS reply itself in
+        // `handleStartTLSReply`.
+        guard reply.code == 220 else {
             fail(context: context, SMTPError.classify(reply))
             return
         }
@@ -254,14 +291,21 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         }
         state = .awaitingStartTLSReply
         writeLine(context: context, "STARTTLS")
-        // Step 2: fence immediately upon writing STARTTLS, closing the
-        // TOCTOU gap between the residual-bytes assertion below and the
-        // actual decoder swap -- the event loop must not service another
-        // read in between.
-        let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
-        context.channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { [weak self] error in
-            self?.fail(context: boundContext.value, .connectionFailed(error))
-        }
+        // NOTE: `autoRead = false` is deliberately NOT set here. Setting it
+        // at this point -- before the server's `220` has even arrived --
+        // synchronously deregisters the socket's read interest at the
+        // kqueue/epoll level on this `true -> false` transition (verified
+        // against the resolved NIOPosix source). Once that happens, the
+        // reactor is never notified when the `220` bytes physically arrive:
+        // they sit unread in the kernel socket buffer forever, and this
+        // handler hangs waiting for a reply it will never be woken for.
+        // This was invisible against `EmbeddedChannel` (used by
+        // `STARTTLSTests`), which hardcodes `autoRead` as always-effectively-
+        // on and never models real read-interest deregistration -- see the
+        // blind-spot comment on `STARTTLSTests` itself. The fence now
+        // happens at the start of `handleStartTLSReply`, synchronously in
+        // reaction to the `220`, which still closes the same TOCTOU gap:
+        // see that method's doc comment for why.
     }
 
     private func handleStartTLSReply(_ reply: SMTPReply, context: ChannelHandlerContext) {
@@ -269,10 +313,41 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             fail(context: context, SMTPError.classify(reply))
             return
         }
+        // Step 2 (moved here from `handlePreTLSEHLOReply`, see that
+        // method's comment for why): fence `autoRead` off as the very
+        // first action taken in response to receiving and validating the
+        // `220`, before the residual-bytes check and before the async
+        // decoder-removal -- still within the same reactor turn/
+        // `channelRead` call stack that delivered the `220`.
+        //
+        // This still closes the same TOCTOU gap the plan's §4.3 step 2
+        // describes: `ByteToMessageHandler` drains all currently-cumulated
+        // bytes for one kernel `read()` synchronously, in a single
+        // `channelRead` dispatch, before yielding back to the event loop --
+        // so same-buffer-injected bytes (arriving concatenated into the
+        // same TCP segment as the `220`) are still sitting in the decoder's
+        // buffer right now and are still caught by the residual-bytes check
+        // below regardless of exactly where within this synchronous stretch
+        // `autoRead` gets disabled. What disabling it here *does* correctly
+        // prevent is a *separate*, subsequent kernel `read()` (a
+        // separate-buffer injection, e.g. a second TCP segment) from being
+        // serviced -- and its bytes handed to `errorCaught`/`channelRead`
+        // on this handler -- before the plaintext decoder is swapped out
+        // for the post-TLS one. That is the actual invariant the plan cares
+        // about, and disabling `autoRead` synchronously here (rather than
+        // earlier, before the `220` even arrived) achieves it without ever
+        // deregistering read interest before the reply we're blocking on
+        // has been delivered.
+        let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
+        context.channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { [weak self] error in
+            self?.fail(context: boundContext.value, .connectionFailed(error))
+        }
         // Step 3: residual-bytes assertion on the buffer that produced this
         // 220 -- catches bytes injected into the *same* read as the 220.
+        // No underlying error here either -- a direct boolean check, not
+        // something caught via `errorCaught`.
         guard !initialDecoder.hasResidualBytesAfterLastReply else {
-            fail(context: context, .starttlsInjection)
+            fail(context: context, .starttlsInjection(underlying: nil))
             return
         }
         performTLSUpgrade(context: context)
@@ -302,16 +377,48 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             // Step 5: NIOSSLClientHandler at `.first`.
             let sslHandler = try SMTPBootstrap.makeSSLHandler(host: host, configuration: tlsConfiguration)
             try context.pipeline.syncOperations.addHandler(sslHandler, position: .first)
-            // Step 6: a fresh decoder above it. `autoRead` stays `false`
-            // until the handshake-completed event fires (handled in
-            // `userInboundEventTriggered`) -- any plaintext bytes injected
-            // before then reach `sslHandler` as bogus TLS record data and
-            // fail the handshake, surfacing via `errorCaught` above.
+            // Step 6: a fresh decoder above it.
             try context.pipeline.syncOperations.addHandler(
-                ByteToMessageHandler(SMTPResponseDecoder()),
+                ByteToMessageHandler(SMTPResponseDecoder(), maximumBufferSize: SMTPBootstrap.maximumReplyBufferSize),
                 name: SMTPBootstrap.Names.decoder,
                 position: .after(sslHandler)
             )
+            // Re-enable `autoRead` here, immediately -- matching the plan's
+            // literal step 6 ("add a fresh decoder, then re-enable
+            // autoRead"), NOT deferred until the handshake-completed event
+            // (a second real-socket hang found via this fix pass's own
+            // real-socket regression test, `STARTTLSRealSocketTests`):
+            // `NIOSSLClientHandler` writes its `ClientHello` on `handlerAdded`
+            // (an outbound action, needing no read interest), but receiving
+            // the server's handshake response requires read interest to
+            // already be registered -- `NIOSSLHandler`'s own internal
+            // `context.read()` pull (in `doFlushReadData`) only fires
+            // *after* a `channelRead` has already occurred, so if read
+            // interest is still deregistered at this point, no
+            // `channelRead` ever happens, `context.read()` is never called,
+            // and the handshake can never receive its first byte -- a
+            // deadlock on any real socket, invisible against
+            // `EmbeddedChannel` (see `STARTTLSTests`' blind-spot comment)
+            // for the same reason as the original FIX #1 bug.
+            //
+            // Re-enabling here does NOT reopen the injection window: the
+            // security invariant was never actually "autoRead stays off
+            // until handshake-complete" -- it comes from `NIOSSLClientHandler`
+            // now sitting *ahead of* (upstream of, in inbound order) both
+            // the fresh decoder and this handler. Any bytes that arrive
+            // now, injected or legitimate, are first fed through
+            // `sslHandler`, which either (a) successfully continues the
+            // real TLS handshake, or (b) fails to parse them as a valid TLS
+            // record / fails certificate verification, surfacing as
+            // `errorCaught` -- mapped to `.starttlsInjection` below exactly
+            // as before. There is no path from raw injected plaintext to
+            // this handler's `channelRead` (the fresh decoder, and this
+            // handler behind it, only ever see `sslHandler`'s decrypted
+            // output) regardless of `autoRead`'s state.
+            let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
+            context.channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { [weak self] error in
+                self?.fail(context: boundContext.value, .connectionFailed(error))
+            }
         } catch {
             fail(context: context, .connectionFailed(error))
         }

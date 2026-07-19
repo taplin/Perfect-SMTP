@@ -29,7 +29,20 @@ public enum SMTPError: Error, Sendable {
     /// The CVE-2026-41319-class buffer-discipline violation: bytes read
     /// from the socket before the TLS handshake would otherwise be
     /// processed as post-TLS input.
-    case starttlsInjection
+    ///
+    /// Milestone review finding (correctness): originally carried no
+    /// associated value, so a legitimate TLS handshake failure (expired
+    /// cert, cipher mismatch, network reset) during the fenced upgrade
+    /// window was indistinguishable from an actual injection attack in
+    /// logs/metrics. `underlying` carries the real cause when one exists
+    /// (the separate-buffer path's NIOSSL handshake failure); `nil` when
+    /// the violation was detected directly by this decoder's own
+    /// residual-bytes logic (the same-buffer path), which has no
+    /// diagnostic value beyond the fact `.starttlsInjection` itself
+    /// already captures. Constrained `any Error & Sendable`, matching
+    /// `.connectionFailed`'s existing precedent for carrying an opaque
+    /// underlying error in a `Sendable` enum.
+    case starttlsInjection(underlying: (any Error & Sendable)?)
     /// MTA-STS / DANE policy violation (Phase 4).
     case tlsPolicyViolation(String)
     case circuitOpen

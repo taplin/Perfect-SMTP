@@ -101,6 +101,17 @@ public enum HeaderEncoder {
     /// character that could be used to inject an additional line.
     public enum HeaderInjectionError: Error, Sendable, Equatable {
         case controlCharacterInField(String)
+        /// Milestone review finding (FIX #2, security pass): an address
+        /// destined for `LocalMTATransport`'s `sendmail -f`/recipient argv
+        /// that starts with `-` would otherwise be interpreted by the local
+        /// MTA's `getopt`-style argv parser as a command-line flag, not a
+        /// literal address (CWE-88 / the CVE-2016-10033-class PHPMailer/
+        /// SwiftMailer vulnerability). Distinct from
+        /// `controlCharacterInField` since this isn't a control-character
+        /// injection -- a leading `-` is a perfectly ordinary, printable
+        /// character in isolation, and only becomes dangerous in the
+        /// specific context of an argv element.
+        case leadingHyphenInField(String)
     }
 
     /// True for any C0 control character (0x00–0x1F) or DEL (0x7F) — the

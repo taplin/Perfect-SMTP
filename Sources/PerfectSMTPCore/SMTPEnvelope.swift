@@ -37,11 +37,32 @@ public enum ReversePath: Sendable, Hashable {
             switch self {
             case .address(let address):
                 let validated = try HeaderEncoder.rejectHeaderInjection(address, field: "MAIL FROM address")
+                try Self.rejectLeadingHyphen(validated, field: "MAIL FROM address")
                 return "MAIL FROM:<\(validated)>"
             case .null:
                 return "MAIL FROM:<>"
             }
         }
+    }
+
+    /// Milestone review finding (FIX #2, security pass, confirmed
+    /// independently by three of the four reviews): `LocalMTATransport`
+    /// passes this address to `sendmail`/Postfix/Exim as a bare `argv`
+    /// element (via `-f`). `Process`'s array form avoids *shell* injection,
+    /// but the local MTA's own `getopt`-style argv parser treats any
+    /// argument starting with `-` as a command-line flag, not a literal
+    /// address -- e.g. `-oQ/tmp/evilqueue@x` or `-C/tmp/attacker.cf` reach
+    /// the subprocess's argv unmodified otherwise, the exact vulnerability
+    /// class behind CVE-2016-10033/10045 (PHPMailer) and CVE-2016-10074
+    /// (SwiftMailer). This is layer 1 of a two-layer defense-in-depth fix;
+    /// layer 2 is `LocalMTATransport.runProcess` inserting a literal `"--"`
+    /// end-of-options separator before the recipient list regardless.
+    /// Deliberately narrow -- this checks only the leading character, not
+    /// general RFC 5321 `addr-spec` grammar, matching Phase 0's established
+    /// scoping discipline of staying narrow to injection-class defenses.
+    static func rejectLeadingHyphen(_ address: String, field: String) throws {
+        guard address.hasPrefix("-") else { return }
+        throw HeaderEncoder.HeaderInjectionError.leadingHyphenInField(field)
     }
 }
 
@@ -98,6 +119,11 @@ public struct SMTPEnvelope: Sendable {
     public init(mailFrom: ReversePath, recipients: [String], size: Int? = nil, dsn: DSNRequest? = nil) throws {
         for recipient in recipients {
             _ = try HeaderEncoder.rejectHeaderInjection(recipient, field: "RCPT TO address")
+            // FIX #2 (security review, CWE-88): reject a leading `-` here
+            // too -- see `ReversePath.rejectLeadingHyphen`'s doc comment.
+            // Recipients reach `LocalMTATransport`'s argv exactly the same
+            // way the reverse-path address does.
+            try ReversePath.rejectLeadingHyphen(recipient, field: "RCPT TO address")
         }
         self.mailFrom = mailFrom
         self.recipients = recipients

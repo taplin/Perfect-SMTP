@@ -41,6 +41,106 @@ struct LocalMTATransportTests {
         return url
     }
 
+    /// Writes a fake MTA that, instead of doing anything MTA-like, dumps
+    /// its own received `argv` (everything after the script path) to a
+    /// sibling file next to itself -- `<script path>.args`, NUL-separated
+    /// -- then exits 0. Used to structurally inspect the exact arguments
+    /// `LocalMTATransport` constructs (FIX #2 layer 2's `"--"` separator,
+    /// FIX #3's `.null` reverse-path `-f` argument) without needing any
+    /// production-code seam to intercept `Process.arguments` directly.
+    /// A sibling file (not an environment variable) is used deliberately:
+    /// FIX #2's defense-in-depth `process.environment` lockdown means the
+    /// subprocess no longer inherits arbitrary environment variables, so
+    /// the sibling-file path is derived purely from the script's own
+    /// `sys.argv[0]`, needing no environment cooperation at all.
+    private func makeArgvCapturingMTA() throws -> URL {
+        let script = """
+        #!/usr/bin/env python3
+        import sys
+        sys.stdin.buffer.read()
+        with open(sys.argv[0] + ".args", "wb") as f:
+            f.write(b"\\x00".join(a.encode("utf-8") for a in sys.argv[1:]))
+        sys.exit(0)
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fake-mta-argv-\(UUID().uuidString).py")
+        try script.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+
+    /// Reads back and splits the argv dump `makeArgvCapturingMTA`'s script
+    /// wrote for a given script URL.
+    private func capturedArguments(for scriptURL: URL) throws -> [String] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: scriptURL.path + ".args"))
+        guard !data.isEmpty else { return [] }
+        return data.split(separator: 0x00, omittingEmptySubsequences: false)
+            .map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    // MARK: - FIX #2 layer 2 (security review, CWE-88, defense-in-depth)
+
+    @Test func recipientsAreSeparatedFromPrecedingOptionsByADoubleDash() async throws {
+        let scriptURL = try makeArgvCapturingMTA()
+        defer {
+            try? FileManager.default.removeItem(at: scriptURL)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: scriptURL.path + ".args"))
+        }
+
+        let transport = LocalMTATransport(config: LocalMTAConfig(executablePath: scriptURL.path))
+        let envelope = try SMTPEnvelope(
+            mailFrom: .address("from@example.com"),
+            recipients: ["a@example.com", "b@example.com"]
+        )
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
+
+        _ = try await transport.send(envelope, message)
+
+        let arguments = try capturedArguments(for: scriptURL)
+        guard let dashDashIndex = arguments.firstIndex(of: "--") else {
+            Issue.record("expected a literal \"--\" end-of-options separator in \(arguments)")
+            return
+        }
+        // Every recipient must appear strictly after "--", and nothing
+        // that looks like a recipient may appear before it.
+        let afterDashDash = arguments[(dashDashIndex + 1)...]
+        #expect(Array(afterDashDash) == ["a@example.com", "b@example.com"])
+        #expect(!arguments[..<dashDashIndex].contains("a@example.com"))
+        #expect(!arguments[..<dashDashIndex].contains("b@example.com"))
+    }
+
+    // MARK: - FIX #3 (protocol correctness, milestone review): null
+    // reverse-path's `-f` argument
+
+    @Test func nullReversePathPassesEmptyStringNotWireAngleBracketsToDashF() async throws {
+        let scriptURL = try makeArgvCapturingMTA()
+        defer {
+            try? FileManager.default.removeItem(at: scriptURL)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: scriptURL.path + ".args"))
+        }
+
+        let transport = LocalMTATransport(config: LocalMTAConfig(executablePath: scriptURL.path))
+        let envelope = try SMTPEnvelope(mailFrom: .null, recipients: ["to@example.com"])
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
+
+        _ = try await transport.send(envelope, message)
+
+        let arguments = try capturedArguments(for: scriptURL)
+        guard let fIndex = arguments.firstIndex(of: "-f") else {
+            Issue.record("expected a \"-f\" argument in \(arguments)")
+            return
+        }
+        guard fIndex + 1 < arguments.count else {
+            Issue.record("expected an argument following \"-f\" in \(arguments)")
+            return
+        }
+        // The fix: an empty string, not the SMTP wire-syntax literal `<>`
+        // (see `LocalMTATransport.runProcess`'s `.null` case for the full
+        // research citation backing this choice).
+        #expect(arguments[fIndex + 1] == "")
+        #expect(arguments[fIndex + 1] != "<>")
+    }
+
     /// Races `body` against a timeout, failing the test explicitly (rather
     /// than hanging the whole suite forever) if the deadlock scenario this
     /// test exists to catch were ever reintroduced.

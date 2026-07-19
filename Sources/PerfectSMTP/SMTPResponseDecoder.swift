@@ -40,7 +40,26 @@ public final class SMTPResponseDecoder: ByteToMessageDecoder, @unchecked Sendabl
         /// close is a genuine protocol violation, not something to
         /// silently ignore.
         case residualBytesOnRemoval
+        /// Thrown from `decode` when a multiline reply's continuation lines
+        /// (`250-...`) exceed `maximumContinuationLines` without a terminal
+        /// line ever arriving. Milestone security review finding (FIX #6):
+        /// without this cap, a malicious/compromised server that keeps
+        /// sending well-formed `250-x\r\n` continuation lines and never
+        /// sends the terminal (`250 `) line grows `pendingLines` without
+        /// limit -- a DoS vector distinct from (and not covered by)
+        /// `ByteToMessageHandler`'s own `maximumBufferSize`, since each
+        /// individual line can be short and still be read out of the
+        /// cumulation buffer one at a time, only `pendingLines` itself
+        /// growing unbounded.
+        case tooManyContinuationLines(limit: Int)
     }
+
+    /// Cap on the number of continuation lines (`250-...`) accumulated for
+    /// one multiline reply before a terminal line must arrive. Real SMTP
+    /// multiline replies (EHLO capability lists being the longest common
+    /// case) are conventionally well under this; 100 is generous headroom
+    /// while still being a hard bound.
+    private static let maximumContinuationLines = 100
 
     private var pendingCode: Int?
     private var pendingLines: [String] = []
@@ -68,7 +87,12 @@ public final class SMTPResponseDecoder: ByteToMessageDecoder, @unchecked Sendabl
         pendingCode = parsed.code
         pendingLines.append(parsed.text)
 
-        guard !parsed.isContinuation else { return .continue }
+        guard !parsed.isContinuation else {
+            guard pendingLines.count <= Self.maximumContinuationLines else {
+                throw DecoderError.tooManyContinuationLines(limit: Self.maximumContinuationLines)
+            }
+            return .continue
+        }
 
         let reply = SMTPReply(code: parsed.code, lines: pendingLines)
         pendingCode = nil

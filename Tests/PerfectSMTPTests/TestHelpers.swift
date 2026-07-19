@@ -98,7 +98,16 @@ enum TestHelperError: Error, CustomStringConvertible {
 /// plays the "server" role directly against the same channel via
 /// `writeInbound`/`waitForOutboundWrite`.
 enum ConnectionHarness {
-    static func make() async throws -> (SMTPConnection, NIOAsyncTestingChannel) {
+    /// `replyTimeout`/`dataTerminationTimeout` default to
+    /// `SMTPConnection.init`'s own production defaults (300s/600s) so every
+    /// existing call site is unaffected; FIX #4's timeout regression test
+    /// overrides `replyTimeout` to a short, real-time-bounded value instead
+    /// (`Task.sleep`-based, not tied to `NIOAsyncTestingEventLoop`'s virtual
+    /// clock, so no `advanceTime` dance is needed to observe it fire).
+    static func make(
+        replyTimeout: Duration = .seconds(300),
+        dataTerminationTimeout: Duration = .seconds(600)
+    ) async throws -> (SMTPConnection, NIOAsyncTestingChannel) {
         let testingChannel = NIOAsyncTestingChannel()
         try await testingChannel.testingEventLoop.executeInContext {
             try testingChannel.pipeline.syncOperations.addHandler(ByteToMessageHandler(SMTPResponseDecoder()))
@@ -107,7 +116,12 @@ enum ConnectionHarness {
         let asyncChannel = try await testingChannel.testingEventLoop.executeInContext {
             try NIOAsyncChannel<SMTPReply, SMTPCommand>(wrappingChannelSynchronously: testingChannel)
         }
-        let connection = SMTPConnection(asyncChannel: asyncChannel, ehloHostname: "client.example.com")
+        let connection = SMTPConnection(
+            asyncChannel: asyncChannel,
+            ehloHostname: "client.example.com",
+            replyTimeout: replyTimeout,
+            dataTerminationTimeout: dataTerminationTimeout
+        )
         return (connection, testingChannel)
     }
 }

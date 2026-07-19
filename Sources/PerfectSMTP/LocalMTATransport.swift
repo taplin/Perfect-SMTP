@@ -82,8 +82,52 @@ public actor LocalMTATransport: SMTPTransport {
         case .address(let address):
             arguments.append(contentsOf: ["-f", address])
         case .null:
-            arguments.append(contentsOf: ["-f", "<>"])
+            // FIX #3 (protocol correctness, milestone review): `MAIL
+            // FROM:<>` is SMTP *wire* syntax; `sendmail`'s command-line
+            // `-f` flag is a separate Unix-argv interface expecting a bare
+            // address string. Researched against actual behavior rather
+            // than guessed a second time (the previous implementer's `-f
+            // "<>"` guess was already wrong once, per the review):
+            //  - Exim's own spec (`ch-the_exim_command_line`) explicitly
+            //    documents BOTH `-f ''` and `-f '<>'` as valid null-sender
+            //    syntax ("An empty sender can be specified either as an
+            //    empty string, or as a pair of angle brackets with nothing
+            //    between them").
+            //  - Empirically verified against the Postfix `sendmail(1)`
+            //    compatibility wrapper on this development host (`/usr/sbin
+            //    /sendmail`, itself confirmed via `man sendmail` to be
+            //    "Postfix to Sendmail compatibility interface" -- exactly
+            //    what this transport's own doc comment says
+            //    `/usr/sbin/sendmail` conventionally resolves to): both
+            //    `-f ""` and `-f "<>"` produce identical accepted behavior
+            //    (`sendmail -bv -f "<>" root` and `-f "" root` both report
+            //    "Mail Delivery Status Report will be mailed to <>."),
+            //    because Postfix's wrapper strips any enclosing angle
+            //    brackets from the `-f` argument before use.
+            //  - A widely-cited cross-implementation compatibility report
+            //    (cyrus-devel mailing list, "sendmail invocation for
+            //    'empty sender' bounces") found the *opposite* split
+            //    historically: Postfix, Debian SMail, and qmail accepted
+            //    `-f ""`, while older Sendmail 8.11.3 required `-f "<>"`
+            //    and rejected an empty string outright -- i.e. even that
+            //    account doesn't support the original code's `<>`-only
+            //    choice as universally correct either.
+            // Given real disagreement across implementations historically,
+            // and no single form being universally safe, `-f ""` is used
+            // here as the more broadly-documented modern convention
+            // (explicit in Exim's spec, empirically confirmed on Postfix)
+            // -- an informed, documented judgment call, not a blind guess.
+            arguments.append(contentsOf: ["-f", ""])
         }
+        // FIX #2 layer 2 (security review, CWE-88, defense-in-depth):
+        // a literal `--` end-of-options separator, signaling to the local
+        // MTA's `getopt`-style argv parser that everything after this
+        // point is a positional argument (a recipient), never a flag --
+        // even if layer 1 (`SMTPEnvelope`/`ReversePath` rejecting a
+        // leading `-` at construction time) is somehow bypassed by a
+        // future code path that constructs recipients outside that
+        // validated init.
+        arguments.append("--")
         arguments.append(contentsOf: envelope.recipients)
 
         try await Self.execute(
@@ -108,6 +152,19 @@ public actor LocalMTATransport: SMTPTransport {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
+        // Milestone review finding (defense-in-depth): `Process` never sets
+        // `environment` by default, so the subprocess inherits the full
+        // parent environment -- every variable the host process has, handed
+        // to the highest-risk new attack surface in this phase (an external
+        // binary invoked with caller-influenced argv). An explicit, minimal
+        // environment limits what a compromised/malicious local MTA binary
+        // -- or a `LD_PRELOAD`/similar environment-based attack riding along
+        // in the parent's environment -- can leverage. `PATH` is the only
+        // variable genuinely required (`executableURL` is already an
+        // absolute path, so `PATH` isn't needed for resolution, but is kept
+        // for any `PATH`-relative behavior the MTA binary's own internals
+        // might have, e.g. shelling out to `sh`/other tools itself).
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
 
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -128,12 +185,26 @@ public actor LocalMTATransport: SMTPTransport {
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
-                let handle = stderrPipe.fileHandleForReading
-                var collected: [UInt8] = []
-                while true {
-                    let chunk = handle.availableData
-                    if chunk.isEmpty { break }
-                    collected.append(contentsOf: chunk)
+                // FIX #7 (concurrency hygiene, milestone review):
+                // `FileHandle.availableData` is a blocking, synchronous
+                // syscall. Running this read loop directly inside a
+                // `TaskGroup` child occupies a Swift Concurrency
+                // cooperative-pool worker thread for the blocking read's
+                // duration -- under concurrent `LocalMTATransport.send()`
+                // calls (exactly what `SMTPMailer`'s bounded-batch fan-out
+                // enables), this risks starving the pool of threads needed
+                // for other async work in the process. `Self.runBlocking`
+                // bridges the whole loop onto a dedicated background
+                // thread instead, off the cooperative pool entirely.
+                let collected = try await Self.runBlocking {
+                    let handle = stderrPipe.fileHandleForReading
+                    var collected: [UInt8] = []
+                    while true {
+                        let chunk = handle.availableData
+                        if chunk.isEmpty { break }
+                        collected.append(contentsOf: chunk)
+                    }
+                    return collected
                 }
                 stderrBox.value = collected
             }
@@ -141,11 +212,14 @@ public actor LocalMTATransport: SMTPTransport {
             group.addTask {
                 // sendmail-compatible shims are usually silent on stdout,
                 // but a verbose one (or `-v`) could otherwise deadlock the
-                // same way an undrained stderr would.
-                let handle = stdoutPipe.fileHandleForReading
-                while true {
-                    let chunk = handle.availableData
-                    if chunk.isEmpty { break }
+                // same way an undrained stderr would. Same off-cooperative-
+                // pool bridging as the stderr drain above (FIX #7).
+                _ = try await Self.runBlocking {
+                    let handle = stdoutPipe.fileHandleForReading
+                    while true {
+                        let chunk = handle.availableData
+                        if chunk.isEmpty { break }
+                    }
                 }
             }
 
@@ -160,6 +234,24 @@ public actor LocalMTATransport: SMTPTransport {
             }
 
             try await group.waitForAll()
+        }
+    }
+
+    /// Bridges a blocking, synchronous closure onto a dedicated background
+    /// thread (`DispatchQueue.global(qos: .utility)`), never the Swift
+    /// Concurrency cooperative thread pool -- FIX #7's mechanism (see the
+    /// stdout/stderr drain call sites above). `@unchecked Sendable`-free:
+    /// `T` is constrained `Sendable` and the closure is `@Sendable`, so no
+    /// unchecked escape hatch is needed here.
+    private static func runBlocking<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    continuation.resume(returning: try body())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 

@@ -68,11 +68,29 @@ public struct SMTPMailer: Sendable {
     /// in-flight tasks independent of the transport's own connection cap
     /// -- never a naive `for msg in messages { group.addTask { ... } }`,
     /// which would launch every child eagerly regardless of capacity.
-    public func send(_ messages: [EmailMessage], envelopeFrom: ReversePath) async throws -> [DeliveryResult] {
+    ///
+    /// **Not all-or-nothing (FIX #5, milestone architecture/concurrency
+    /// review, required correction):** the original implementation used
+    /// `withThrowingTaskGroup`, so per structured-concurrency semantics any
+    /// single child's throw (an envelope-level `MAIL FROM` rejection, a
+    /// connection error, a compose/DKIM failure -- as opposed to a
+    /// per-recipient rejection, which already correctly becomes a
+    /// `DeliveryResult` rather than a throw) cancelled every other in-
+    /// flight/pending child and aborted the whole call, discarding all
+    /// already-collected results. For a batch API explicitly motivated by
+    /// list-server/bulk-mail use (plan §8), one bad message losing every
+    /// other good one in the batch is a significant usability gap. Each
+    /// child task below catches its own message's error instead and maps
+    /// it to a `.failed(error)` `DeliveryResult` per that message's
+    /// would-be recipients, so the function no longer needs `throws` at
+    /// all: the only pre-flight case (`messages.isEmpty`) already returns
+    /// `[]` synchronously rather than throwing, and every other failure
+    /// mode is now representable as data in the returned array.
+    public func send(_ messages: [EmailMessage], envelopeFrom: ReversePath) async -> [DeliveryResult] {
         guard !messages.isEmpty else { return [] }
         let maxInFlight = max(1, configuration.maxInFlightBatchSends)
 
-        return try await withThrowingTaskGroup(of: (Int, [DeliveryResult]).self) { group in
+        return await withTaskGroup(of: (Int, [DeliveryResult]).self) { group in
             var results = [[DeliveryResult]](repeating: [], count: messages.count)
             var nextIndex = 0
 
@@ -82,15 +100,28 @@ public struct SMTPMailer: Sendable {
                 let message = messages[index]
                 nextIndex += 1
                 group.addTask {
-                    let sent = try await self.send(message, envelopeFrom: envelopeFrom)
-                    return (index, sent)
+                    do {
+                        let sent = try await self.send(message, envelopeFrom: envelopeFrom)
+                        return (index, sent)
+                    } catch {
+                        // This message's own recipients (to + cc -- the
+                        // batch overload never takes a per-message `bcc`,
+                        // matching `self.send`'s own recipient formula
+                        // absent a `bcc` argument), each reported as
+                        // `.failed`, so the caller still sees exactly one
+                        // outcome per intended recipient rather than the
+                        // message vanishing from the results entirely.
+                        let recipients = message.to.map(\.address) + message.cc.map(\.address)
+                        let failed = recipients.map { DeliveryResult(recipient: $0, outcome: .failed(error)) }
+                        return (index, failed)
+                    }
                 }
             }
 
             let primeCount = min(maxInFlight, messages.count)
             for _ in 0..<primeCount { addNextTask() }
 
-            while let (index, sent) = try await group.next() {
+            while let (index, sent) = await group.next() {
                 results[index] = sent
                 addNextTask()
             }

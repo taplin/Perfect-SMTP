@@ -32,5 +32,18 @@ public struct DeliveryResult: Sendable {
         /// of no return. Surfaced, never auto-retried (default policy:
         /// at-most-once) — a retry here risks double delivery.
         case ambiguous(SMTPReply?)
+        /// A transport-level or pre-flight failure with no `SMTPReply` to
+        /// attach at all — a connection/timeout error, a DKIM/compose
+        /// failure, a circuit-breaker rejection, or any other thrown error
+        /// that isn't a classified SMTP-protocol reply. Added for FIX #5
+        /// (milestone architecture/concurrency review): `SMTPMailer`'s
+        /// batch `send([EmailMessage], envelopeFrom:)` maps a single
+        /// message's thrown failure to this case (one per that message's
+        /// would-be recipients) instead of letting the throw cancel and
+        /// discard every other in-flight/pending message in the batch —
+        /// same shape as `SMTPError.connectionFailed(any Error &
+        /// Sendable)`'s existing precedent for carrying an opaque
+        /// underlying error.
+        case failed(any Error & Sendable)
     }
 }

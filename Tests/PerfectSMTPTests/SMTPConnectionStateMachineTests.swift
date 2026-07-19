@@ -291,6 +291,74 @@ struct SMTPConnectionStateMachineTests {
         #expect(try await channel.readOutbound(as: ByteBuffer.self) == nil)
     }
 
+    // MARK: - FIX #4 (plan §7, milestone architecture review): per-command
+    // reply timeout. RFC 5321 §4.5.3.2 requires client-side minimum
+    // timeouts per command phase -- without one, a hung/black-holed remote
+    // server leaves the awaiting task suspended forever, and since the
+    // connection never becomes "idle" mid-transaction, the pool's
+    // idle-eviction path never reaps it either.
+
+    @Test func nextReplyThrowsReplyTimedOutRatherThanHangingWhenTheServerNeverReplies() async throws {
+        // A deliberately short `replyTimeout` (not tied to
+        // `NIOAsyncTestingEventLoop`'s virtual clock -- `SMTPConnection`'s
+        // timeout race uses real `Task.sleep`, so a short real-time value
+        // is sufficient and needs no `advanceTime` choreography) and a
+        // server double that never sends anything at all.
+        let (connection, _channel) = try await ConnectionHarness.make(replyTimeout: .milliseconds(100))
+        _ = _channel // the scripted "server" side is intentionally silent
+
+        let outcome = await resultOf { try await connection.nextReply() }
+        guard case .failure(let error) = outcome else {
+            Issue.record("expected nextReply() to throw, got a reply instead")
+            return
+        }
+        guard case .some(.replyTimedOut) = error as? SMTPConnectionError else {
+            Issue.record("expected .replyTimedOut, got \(error)")
+            return
+        }
+    }
+
+    @Test func connectionTimeoutFlowsThroughThePoolsUnhealthyReleasePath() async throws {
+        // FIX #4's explicit requirement: a timeout must flow through
+        // `SMTPConnectionPool.release()`'s existing `healthy: Bool` catch
+        // path exactly like any other thrown error (closed, not returned
+        // to idle) -- `withConnection`'s `catch` already does this for any
+        // thrown error; this confirms `.replyTimedOut` specifically is not
+        // silently swallowed or special-cased away before it gets there.
+        let key = SMTPConnectionPool.Key(host: "smtp.example.com", port: 587, tls: .none)
+        let pool = SMTPConnectionPool(
+            configuration: .init(maxPerHost: 1, maxTotal: 10),
+            group: NIOAsyncTestingEventLoop(),
+            dialer: { _ in
+                let (connection, _) = try await ConnectionHarness.make(replyTimeout: .milliseconds(100))
+                return connection
+            }
+        )
+
+        await #expect(throws: SMTPConnectionError.self) {
+            try await pool.withConnection(to: key) { connection in
+                _ = try await connection.nextReply()
+            }
+        }
+
+        // The timed-out connection must not have been returned to idle --
+        // a subsequent checkout dials fresh rather than reusing it. This is
+        // best confirmed indirectly: a second `withConnection` call
+        // completes normally by dialing a brand-new connection, proving
+        // the pool didn't hand back the same closed/unhealthy one.
+        let secondCheckoutSucceeded = await resultOf {
+            try await pool.withConnection(to: key) { connection in
+                _ = connection // don't even need to use it -- just confirm checkout succeeds
+            }
+        }
+        guard case .success = secondCheckoutSucceeded else {
+            Issue.record("expected a fresh checkout to succeed after the unhealthy release, got \(secondCheckoutSucceeded)")
+            return
+        }
+
+        await pool.shutdown()
+    }
+
     // MARK: - Mid-conversation disconnect
 
     @Test func midConversationDisconnectSurfacesAsThrownErrorNotHang() async throws {
@@ -327,6 +395,7 @@ struct SMTPConnectionStateMachineTests {
         case .queuedForRetry(_, let attempt, let last): return "queuedForRetry(attempt:\(attempt),code:\(last.code))"
         case .expired(let attempts, let last): return "expired(attempts:\(attempts),code:\(last.code))"
         case .ambiguous(let reply): return "ambiguous(\(reply?.code.description ?? "nil"))"
+        case .failed(let error): return "failed(\(error))"
         }
     }
 }

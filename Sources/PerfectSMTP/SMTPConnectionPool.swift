@@ -10,6 +10,23 @@
 import Foundation
 import NIOCore
 
+/// Milestone review finding (documentation-only, no `Key` redesign this
+/// pass): `Key` is `(host, port, tls)` **only** -- it has no credential or
+/// tenant dimension. A connection dialed and authenticated for one
+/// credential set is, from this pool's point of view, fungible with any
+/// other checkout for the same `(host, port, tls)`, and will be handed back
+/// out (already authenticated -- see `SMTPConnection.isAuthenticated`) to
+/// whichever caller checks out next. This is safe **only** because
+/// `RelayTransport` owns exactly one fixed `config.auth` per pool instance
+/// -- every checkout against a given `RelayTransport`'s pool is implicitly
+/// "the same identity" by construction, so there is no cross-credential
+/// leakage in this package's own usage. **Integrators building multi-tenant
+/// systems directly on top of the public `SMTPConnectionPool` API must not
+/// share one pool instance across multiple credential sets against the same
+/// `(host, port, tls)`** -- doing so risks a connection authenticated as
+/// one identity being reused for another. If a future need justifies it,
+/// `Key` could be extended with a credential fingerprint, but that redesign
+/// is out of scope for this fix pass.
 public actor SMTPConnectionPool {
     public struct Key: Hashable, Sendable {
         public let host: String
@@ -29,6 +46,17 @@ public actor SMTPConnectionPool {
         public var connectTimeout: TimeAmount
         public var circuitBreakerThreshold: Int
         public var circuitBreakerResetTimeout: Duration
+        /// FIX #4 (plan §7, milestone architecture review): per-command
+        /// reply/write timeout threaded into every pool-dialed
+        /// `SMTPConnection`, so a hung/black-holed remote server can't pin
+        /// a pooled connection indefinitely (see `SMTPConnection`'s own
+        /// doc comments). RFC 5321 §4.5.3.2's general per-command minimum.
+        public var replyTimeout: Duration
+        /// FIX #4's phase-specific exception: RFC 5321 §4.5.3.2's longer
+        /// minimum specifically for the final reply after the DATA
+        /// terminator, where the server may legitimately be doing real
+        /// work (spooling/scanning a large message).
+        public var dataTerminationTimeout: Duration
 
         public init(
             maxPerHost: Int = 4,
@@ -36,7 +64,9 @@ public actor SMTPConnectionPool {
             idleTimeout: Duration = .seconds(60),
             connectTimeout: TimeAmount = .seconds(30),
             circuitBreakerThreshold: Int = 5,
-            circuitBreakerResetTimeout: Duration = .seconds(30)
+            circuitBreakerResetTimeout: Duration = .seconds(30),
+            replyTimeout: Duration = .seconds(300),
+            dataTerminationTimeout: Duration = .seconds(600)
         ) {
             self.maxPerHost = maxPerHost
             self.maxTotal = maxTotal
@@ -44,6 +74,8 @@ public actor SMTPConnectionPool {
             self.connectTimeout = connectTimeout
             self.circuitBreakerThreshold = circuitBreakerThreshold
             self.circuitBreakerResetTimeout = circuitBreakerResetTimeout
+            self.replyTimeout = replyTimeout
+            self.dataTerminationTimeout = dataTerminationTimeout
         }
     }
 
@@ -130,12 +162,19 @@ public actor SMTPConnectionPool {
         let capturedGroup = group
         let capturedTimeout = configuration.connectTimeout
         let capturedHostname = ehloHostname
+        let capturedReplyTimeout = configuration.replyTimeout
+        let capturedDataTerminationTimeout = configuration.dataTerminationTimeout
         self.dialer = { key in
             let asyncChannel = try await SMTPBootstrap.connect(
                 host: key.host, port: key.port, tls: key.tls,
                 connectTimeout: capturedTimeout, group: capturedGroup
             )
-            let connection = SMTPConnection(asyncChannel: asyncChannel, ehloHostname: capturedHostname)
+            let connection = SMTPConnection(
+                asyncChannel: asyncChannel,
+                ehloHostname: capturedHostname,
+                replyTimeout: capturedReplyTimeout,
+                dataTerminationTimeout: capturedDataTerminationTimeout
+            )
             try await connection.negotiateCapabilities()
             return connection
         }
@@ -274,6 +313,17 @@ public actor SMTPConnectionPool {
     // MARK: - Release
 
     private func release(_ key: Key, connection: SMTPConnection, healthy: Bool) {
+        // Milestone review finding (correctness): a connection released
+        // after `shutdown()` has already run must not be appended to
+        // `idle[key]` -- `shutdown()` only closes/drains what's *already*
+        // idle/parked at the moment it runs, and nothing ever pops/closes
+        // an entry added afterward, leaking the connection (and its
+        // socket) for the lifetime of the process. Close it immediately
+        // instead.
+        guard !isShutDown else {
+            connection.channel.close(promise: nil)
+            return
+        }
         if healthy, connection.channel.isActive {
             recordSuccess(key)
             if handOff(key, outcome: .connection(connection)) { return }
