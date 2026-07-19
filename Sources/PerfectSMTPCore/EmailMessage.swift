@@ -91,6 +91,57 @@ public enum AutoSubmitted: String, Sendable, Equatable {
     case autoNotified = "auto-notified"
 }
 
+/// Caller-supplied override for the auto-computed `Content-Transfer-Encoding`
+/// of the message's primary body (see `EmailMessage.bodyTransferEncodingOverride`'s
+/// doc comment for what "primary body" means and when this override
+/// applies). Explicitly typed rather than a raw string, so `MIMEComposer`
+/// can validate it against the actual body bytes at compose time instead of
+/// trusting an arbitrary caller-supplied label.
+///
+/// RFC 2045 §6.1 also defines `8bit` and `binary` mechanisms, but neither is
+/// offered here:
+/// - `8bit`/`binary` are identity (no-transform) labels, not real encodings
+///   (RFC 2045 §6.2: "The Content-Transfer-Encoding values '7bit', '8bit',
+///   and 'binary' all mean that the identity (i.e. NO) encoding
+///   transformation has been performed"). Offering them as an "override"
+///   alongside two encodings that actually transform the bytes into the
+///   7bit range would invite exactly the mislabeling risk this feature
+///   exists to prevent, for no benefit — a caller who wants an
+///   unencoded/binary-domain body can already get validated 7bit-safety via
+///   `.sevenBit`, or a real transform via `.quotedPrintable`/`.base64`.
+/// - Concretely, in this codebase: `Capabilities.swift` parses the `8BITMIME`
+///   EHLO capability into `eightBitMIME`, but nothing in the transport layer
+///   ever reads that flag to negotiate `MAIL FROM ... BODY=8BITMIME` (RFC
+///   6152) before actually sending unencoded 8-bit body octets. Emitting a
+///   part labeled `8bit` today would misdescribe what was actually
+///   negotiated with the server — the same class of transit-corruption risk
+///   labeling non-ASCII content `7bit` would create, just via a different
+///   mechanism (relays/gateways enforcing 7bit-clean transport on a
+///   connection that never advertised/requested 8BITMIME, rather than
+///   silently stripping the 8th bit).
+/// - `binary` is even further out of scope: RFC 2045 §6.2 says outright
+///   "there are no standardized Internet mail transports for which it is
+///   legitimate to include unencoded binary data in mail bodies," and RFC
+///   2045 §6.4 forbids any non-`7bit`/`8bit`/`binary` encoding on composite
+///   (multipart) entities regardless — this library has no `BINARYMIME`
+///   (RFC 3030) support at all.
+public enum ContentTransferEncodingOverride: Sendable, Equatable {
+    /// Claims the body is already 7bit-clean ASCII with no transformation
+    /// applied. `MIMEComposer` validates this against the actual body bytes
+    /// at compose time and throws rather than emitting a mislabeled `7bit`
+    /// part — RFC 2045 §6.2: "Labelling unencoded data containing 8bit
+    /// characters as '7bit' is not allowed."
+    case sevenBit
+    /// Applies RFC 2045 §6.7 quoted-printable encoding to the body,
+    /// regardless of what `MIMEComposer` would otherwise have chosen. Always
+    /// representable, so no content-based validation is needed.
+    case quotedPrintable
+    /// Applies RFC 2045 §6.8 base64 encoding to the body, regardless of what
+    /// `MIMEComposer` would otherwise have chosen. Always representable, so
+    /// no content-based validation is needed.
+    case base64
+}
+
 /// An inline, `cid:`-referenced resource for `multipart/related` (Lasso
 /// `-htmlImages`). Payload is a value type (`Data`), never a stream/file
 /// handle — required for `Sendable` per the plan's §4.7 caveat.
@@ -146,6 +197,48 @@ public struct EmailMessage: Sendable {
     public var subject: String
     public var textBody: String?
     public var htmlBody: String?
+    /// Overrides the declared `Content-Type` of the message's primary body
+    /// part instead of the value `MIMEComposer` would otherwise compute
+    /// (`text/plain; charset=...` or `text/html; charset=...`). Rare,
+    /// legacy-compatibility escape hatch for the Lasso `-contentType`
+    /// dash-param — most callers should leave this `nil` and let
+    /// `MIMEComposer` choose correctly.
+    ///
+    /// **Applies only when exactly one of `textBody`/`htmlBody` is set.**
+    /// When both are set, the message composes to a `multipart/alternative`
+    /// wrapper containing two leaf parts (plain and html) — there is no
+    /// single "the body" for a single-target override to unambiguously mean,
+    /// and the legacy Lasso tag this exists for is a simple, single-body
+    /// send (Lasso 8.5's original mail-send tags took one body plus one
+    /// content-type/encoding pair, not a per-alternative override). Setting
+    /// this alongside both `textBody` and `htmlBody` therefore throws
+    /// `MIMEComposer.ComposerError.bodyOverrideRequiresSingleBodyPart` at
+    /// compose time rather than guessing which alternative (or the wrapper
+    /// itself) the caller meant.
+    ///
+    /// Emitted verbatim (not validated as a well-formed MIME type), but
+    /// still routed through the same CRLF-injection rejection
+    /// (`HeaderEncoder.rejectHeaderInjection`) every other caller-controlled
+    /// header value in `MIMEComposer` goes through — a CRLF here throws
+    /// `ComposerError.invalidHeaderValue("bodyContentTypeOverride")` rather
+    /// than being silently stripped.
+    public var bodyContentTypeOverride: String?
+    /// Overrides the automatically-computed `Content-Transfer-Encoding` for
+    /// the message's primary body part — same single-body-only applicability
+    /// as `bodyContentTypeOverride` (see its doc comment; both fields share
+    /// the same "which part does this apply to" answer and the same
+    /// `bodyOverrideRequiresSingleBodyPart` failure mode when both `textBody`
+    /// and `htmlBody` are set). Legacy-compatibility escape hatch for the
+    /// Lasso `-transferEncoding` dash-param.
+    ///
+    /// `MIMEComposer` validates this against the actual body bytes at
+    /// compose time and throws rather than silently emitting a mislabeled
+    /// encoding that could corrupt the message in transit — see
+    /// `ContentTransferEncodingOverride`'s doc comment for the full
+    /// validation rules and RFC 2045 citations, and
+    /// `ComposerError.sevenBitOverrideRequiresASCIIBody` for the specific
+    /// failure this guards against.
+    public var bodyTransferEncodingOverride: ContentTransferEncodingOverride?
     public var inlineImages: [InlineResource]
     public var attachments: [Attachment]
     public var priority: Priority
@@ -223,6 +316,8 @@ public struct EmailMessage: Sendable {
         subject: String = "",
         textBody: String? = nil,
         htmlBody: String? = nil,
+        bodyContentTypeOverride: String? = nil,
+        bodyTransferEncodingOverride: ContentTransferEncodingOverride? = nil,
         inlineImages: [InlineResource] = [],
         attachments: [Attachment] = [],
         priority: Priority = .normal,
@@ -245,6 +340,8 @@ public struct EmailMessage: Sendable {
         self.subject = subject
         self.textBody = textBody
         self.htmlBody = htmlBody
+        self.bodyContentTypeOverride = bodyContentTypeOverride
+        self.bodyTransferEncodingOverride = bodyTransferEncodingOverride
         self.inlineImages = inlineImages
         self.attachments = attachments
         self.priority = priority

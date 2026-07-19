@@ -282,6 +282,160 @@ struct MIMEComposerTests {
         #expect(body.contains("filename=\"passwd\""))
         #expect(!body.contains("/etc/passwd"))
     }
+
+    // MARK: - bodyContentTypeOverride / bodyTransferEncodingOverride (Lasso -contentType/-transferEncoding)
+    //
+    // Added for the LassoPerfectSMTP integration's legacy dash-params.
+    // Both fields default to nil and are additive/opt-in -- see
+    // `bodyOverrideFieldsNilProducesUnchangedSingleLeafOutput` for the
+    // regression proof that leaving them unset doesn't change existing
+    // behavior at all, plus the full pre-existing golden-fixture tests above
+    // (none of which set either field) continuing to pass unchanged.
+
+    @Test func bodyOverrideFieldsNilProducesUnchangedSingleLeafOutput() throws {
+        // Byte-for-byte identical assertions to
+        // `singlePlainTextBodyIsNotWrappedInAnyMultipart` above, just with
+        // both new fields explicitly (redundantly) left at their nil
+        // default, to document that this is the additive/opt-in
+        // no-override case.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.subject = "Hello"
+        message.textBody = "hello world"
+        message.bodyContentTypeOverride = nil
+        message.bodyTransferEncodingOverride = nil
+        message.date = fixedDate
+        message.messageID = "<fixed@example.com>"
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Type") == "text/plain; charset=utf-8")
+        #expect(header(composed, "Content-Transfer-Encoding") == "7bit")
+        #expect(String(decoding: composed.body, as: UTF8.self) == "hello world")
+    }
+
+    @Test func bodyContentTypeOverrideIsEmittedVerbatimAsBodyContentType() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyContentTypeOverride = "text/x-legacy; charset=iso-8859-1"
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Type") == "text/x-legacy; charset=iso-8859-1")
+        // Transfer-encoding is untouched by a content-type-only override --
+        // still auto-computed (ASCII body -> 7bit).
+        #expect(header(composed, "Content-Transfer-Encoding") == "7bit")
+    }
+
+    @Test func bodyTransferEncodingOverrideSevenBitWithASCIIBodySucceeds() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyTransferEncodingOverride = .sevenBit
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "7bit")
+        #expect(String(decoding: composed.body, as: UTF8.self) == "hello world")
+    }
+
+    @Test func bodyTransferEncodingOverrideSevenBitWithNonASCIIBodyThrowsAndDoesNotEmit7bit() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "Caf\u{e9}" // contains a byte >= 0x80 in UTF-8
+        message.bodyTransferEncodingOverride = .sevenBit
+
+        #expect(throws: MIMEComposer.ComposerError.sevenBitOverrideRequiresASCIIBody) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyTransferEncodingOverrideQuotedPrintableActuallyEncodesASCIIBody() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "100% = great"
+        message.bodyTransferEncodingOverride = .quotedPrintable
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "quoted-printable")
+        // Genuinely quoted-printable-encoded, not just labeled: '=' and the
+        // '%' sign are escaped by the real QP transform.
+        #expect(String(decoding: composed.body, as: UTF8.self) == Encoders.quotedPrintable("100% = great"))
+        #expect(String(decoding: composed.body, as: UTF8.self).contains("=3D"))
+    }
+
+    @Test func bodyTransferEncodingOverrideQuotedPrintableActuallyEncodesNonASCIIBody() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "Caf\u{e9}"
+        message.bodyTransferEncodingOverride = .quotedPrintable
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "quoted-printable")
+        #expect(String(decoding: composed.body, as: UTF8.self) == "Caf=C3=A9")
+    }
+
+    @Test func bodyTransferEncodingOverrideBase64ActuallyEncodesASCIIBody() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyTransferEncodingOverride = .base64
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "base64")
+        let bodyString = String(decoding: composed.body, as: UTF8.self)
+        // Genuinely base64-encoded, not just labeled: decoding it round-trips
+        // to the original CRLF-normalized text, and the raw plaintext never
+        // appears in the wire bytes.
+        #expect(!bodyString.contains("hello world"))
+        let decoded = try #require(Data(base64Encoded: bodyString.replacingOccurrences(of: "\r\n", with: "")))
+        #expect(String(decoding: decoded, as: UTF8.self) == "hello world")
+    }
+
+    @Test func bodyTransferEncodingOverrideBase64ActuallyEncodesNonASCIIBody() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "Caf\u{e9}"
+        message.bodyTransferEncodingOverride = .base64
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Transfer-Encoding") == "base64")
+        let bodyString = String(decoding: composed.body, as: UTF8.self)
+        let decoded = try #require(Data(base64Encoded: bodyString.replacingOccurrences(of: "\r\n", with: "")))
+        #expect(String(decoding: decoded, as: UTF8.self) == "Caf\u{e9}")
+    }
+
+    @Test func bothOverridesTogetherAreBothAppliedToTheSameSingleLeaf() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello world"
+        message.bodyContentTypeOverride = "application/x-legacy"
+        message.bodyTransferEncodingOverride = .base64
+
+        let composed = try MIMEComposer(message).compose()
+
+        #expect(header(composed, "Content-Type") == "application/x-legacy")
+        #expect(header(composed, "Content-Transfer-Encoding") == "base64")
+    }
+
+    @Test func bodyContentTypeOverrideWithBothTextAndHTMLBodiesThrows() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello"
+        message.htmlBody = "<p>hello</p>"
+        message.bodyContentTypeOverride = "text/x-legacy"
+
+        #expect(throws: MIMEComposer.ComposerError.bodyOverrideRequiresSingleBodyPart) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func bodyTransferEncodingOverrideWithBothTextAndHTMLBodiesThrows() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hello"
+        message.htmlBody = "<p>hello</p>"
+        message.bodyTransferEncodingOverride = .sevenBit
+
+        #expect(throws: MIMEComposer.ComposerError.bodyOverrideRequiresSingleBodyPart) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
 }
 
 private func header(_ message: RFC5322Message, _ name: String) -> String? {

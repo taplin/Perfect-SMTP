@@ -243,4 +243,31 @@ struct BugRegressionTests {
             _ = try MIMEComposer(inlineAttempt).compose()
         }
     }
+
+    // MARK: - Bug #1 class, new vector: bodyContentTypeOverride CRLF injection
+    //
+    // `bodyContentTypeOverride` (added for the LassoPerfectSMTP
+    // `-contentType`/`-transferEncoding` legacy dash-params) is a new
+    // caller-controlled string that gets embedded raw into a MIME part's own
+    // `Content-Type` header line -- the same injection shape as finding #4's
+    // `attachment.contentType`/`inlineResource.contentType` above. Routed
+    // through the identical `requireNoInjection` discipline, so a CRLF here
+    // must throw, not silently strip, and must not be able to produce a live
+    // extra header inside the body part.
+
+    @Test func finding5_bodyContentTypeOverrideCRLFInjectionAttemptIsRejectedNotSilentlyStripped() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        message.bodyContentTypeOverride = "text/plain\r\nX-Injected-CT: yes"
+
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("bodyContentTypeOverride")) {
+            _ = try MIMEComposer(message).compose()
+        }
+
+        // There is no serialized message to inspect (composition throws
+        // before producing one) -- which is itself the assertion, matching
+        // finding #2's precedent: the old-style bypass's defining
+        // characteristic was that composition *succeeded* and silently
+        // included the injected header line.
+    }
 }

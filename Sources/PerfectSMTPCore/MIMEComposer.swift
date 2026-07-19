@@ -75,6 +75,32 @@ public struct MIMEComposer: Sendable {
         /// syntax), so this check is List-Unsubscribe-specific rather than
         /// a broadening of the general injection check.
         case listUnsubscribeValueContainsDelimiterCharacter(String)
+        /// `EmailMessage.bodyContentTypeOverride` and/or
+        /// `bodyTransferEncodingOverride` was set, but the message has both
+        /// `textBody` and `htmlBody` present — it composes to a
+        /// `multipart/alternative` wrapper containing two leaf parts, so
+        /// there is no single, unambiguous "the body" for a single-target
+        /// override to mean. See `EmailMessage.bodyContentTypeOverride`'s
+        /// doc comment for the full reasoning (the legacy Lasso
+        /// `-contentType`/`-transferEncoding` params these overrides exist
+        /// for are a simple, single-body send). Also sidesteps RFC 2045
+        /// §6.4, which forbids giving a `multipart` entity any
+        /// Content-Transfer-Encoding other than `7bit`/`8bit`/`binary` —
+        /// applying `.quotedPrintable`/`.base64` to the wrapper itself
+        /// would be a protocol violation, not just an ambiguous target.
+        /// Fails loud rather than guessing, matching this composer's
+        /// established caller-misconfiguration precedent
+        /// (`postOneClickRequiresURL`, `forbiddenHeader`).
+        case bodyOverrideRequiresSingleBodyPart
+        /// `bodyTransferEncodingOverride == .sevenBit` but the body (the
+        /// single `textBody` xor `htmlBody` leaf the override applies to)
+        /// contains a byte >= 0x80 — RFC 2045 §6.2: "Labelling unencoded
+        /// data containing 8bit characters as '7bit' is not allowed." Fails
+        /// loud rather than emitting a mislabeled `7bit` part: an
+        /// intermediate relay that trusts the `7bit` label and strips the
+        /// 8th bit on the (actually non-ASCII) body would silently corrupt
+        /// the message in transit.
+        case sevenBitOverrideRequiresASCIIBody
     }
 
     /// Case-insensitive denylist of header names `extraHeaders` may never
@@ -357,12 +383,26 @@ public struct MIMEComposer: Sendable {
     // MARK: - Tree construction
 
     private func buildTopLevelPart() throws -> MIMEPart {
+        // `bodyContentTypeOverride`/`bodyTransferEncodingOverride` only ever
+        // have a single, unambiguous target: the lone `textBody` xor
+        // `htmlBody` leaf. When both are present the message composes to a
+        // `multipart/alternative` wrapper instead of one leaf, so a caller
+        // who set either override alongside both bodies has made a
+        // configuration mistake this composer surfaces rather than papers
+        // over — see `ComposerError.bodyOverrideRequiresSingleBodyPart`'s
+        // doc comment. Checked before building either leaf so the error is
+        // reported regardless of which leaf would otherwise "win".
+        if message.textBody != nil, message.htmlBody != nil,
+           message.bodyContentTypeOverride != nil || message.bodyTransferEncodingOverride != nil {
+            throw ComposerError.bodyOverrideRequiresSingleBodyPart
+        }
+
         var bodyParts: [MIMEPart] = []
         if let text = message.textBody {
-            bodyParts.append(textLeaf(text, subtype: "plain"))
+            bodyParts.append(try textLeaf(text, subtype: "plain"))
         }
         if let html = message.htmlBody {
-            bodyParts.append(textLeaf(html, subtype: "html"))
+            bodyParts.append(try textLeaf(html, subtype: "html"))
         }
 
         let alternativeOrSingle: MIMEPart
@@ -401,23 +441,70 @@ public struct MIMEComposer: Sendable {
         return relatedOrSingle
     }
 
-    private func textLeaf(_ text: String, subtype: String) -> MIMEPart {
+    /// Builds a `text/plain` or `text/html` leaf part. When
+    /// `message.bodyContentTypeOverride`/`bodyTransferEncodingOverride` are
+    /// set, this is guaranteed by `buildTopLevelPart`'s single-body-part
+    /// guard to be the *only* body leaf being built for this message, so
+    /// applying the override here unconditionally (no further "is this the
+    /// right part" check needed) is safe.
+    private func textLeaf(_ text: String, subtype: String) throws -> MIMEPart {
         let isASCII = text.utf8.allSatisfy { $0 < 0x80 }
-        let cte: String
-        let bodyString: String
-        if isASCII {
-            cte = "7bit"
-            bodyString = normalizeLineEndings(text)
+
+        let contentType: String
+        if let override = message.bodyContentTypeOverride {
+            try Self.requireNoInjection(override, field: "bodyContentTypeOverride")
+            contentType = override
         } else {
-            cte = "quoted-printable"
-            bodyString = Encoders.quotedPrintable(text)
+            contentType = "text/\(subtype); charset=\(charset)"
         }
+
+        let cte: String
+        let bodyBytes: [UInt8]
+        switch message.bodyTransferEncodingOverride {
+        case .sevenBit:
+            // RFC 2045 §6.2: "Labelling unencoded data containing 8bit
+            // characters as '7bit' is not allowed." Validated against the
+            // actual bytes, not just trusted, since a caller-supplied label
+            // that doesn't match the real content is exactly the
+            // transit-corruption risk this override exists to avoid
+            // reopening.
+            guard isASCII else { throw ComposerError.sevenBitOverrideRequiresASCIIBody }
+            cte = "7bit"
+            bodyBytes = Array(normalizeLineEndings(text).utf8)
+        case .quotedPrintable:
+            // Always representable regardless of body content — genuinely
+            // applies RFC 2045 §6.7 encoding to the bytes (not just a header
+            // label), same `Encoders.quotedPrintable` used by the
+            // auto-computed non-ASCII path below.
+            cte = "quoted-printable"
+            bodyBytes = Array(Encoders.quotedPrintable(text).utf8)
+        case .base64:
+            // Always representable regardless of body content — genuinely
+            // applies RFC 2045 §6.8 encoding to the bytes (not just a header
+            // label), same `Encoders.base64Wrapped` used by attachments/
+            // inline resources. Line endings are normalized to CRLF first
+            // (RFC 2045's canonical form for text media) before being
+            // base64-encoded, matching the 7bit/quoted-printable paths.
+            cte = "base64"
+            bodyBytes = Array(Encoders.base64Wrapped(Data(normalizeLineEndings(text).utf8)).utf8)
+        case nil:
+            // No override — original auto-computed behavior, byte-for-byte
+            // unchanged from before this feature existed.
+            if isASCII {
+                cte = "7bit"
+                bodyBytes = Array(normalizeLineEndings(text).utf8)
+            } else {
+                cte = "quoted-printable"
+                bodyBytes = Array(Encoders.quotedPrintable(text).utf8)
+            }
+        }
+
         return MIMEPart(
             headers: [
-                ("Content-Type", "text/\(subtype); charset=\(charset)"),
+                ("Content-Type", contentType),
                 ("Content-Transfer-Encoding", cte),
             ],
-            body: .leaf(Array(bodyString.utf8))
+            body: .leaf(bodyBytes)
         )
     }
 
