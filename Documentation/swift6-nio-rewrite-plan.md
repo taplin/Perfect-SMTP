@@ -228,6 +228,7 @@ public struct EmailMessage: Sendable {
     public var references: [String]
     public var listUnsubscribe: ListUnsubscribe?    // RFC 8058 (Phase 5)
     public var autoSubmitted: AutoSubmitted?        // RFC 3834 (Phase 5)
+    public var precedence: Precedence?              // de facto, RFC 3834-adjacent (Phase 5)
     public var extraHeaders: [(name: String, value: String)]   // denylist-filtered — see below
     public var charset: String = "utf-8"
     public var defaultDisposition: ContentDisposition = .attachment
@@ -356,14 +357,16 @@ let signed   = try dkim.sign(composed).frozen()
 let results  = try await transport.send(envelope, signed)
 ```
 
-**Async job/track:**
+**Async job/track — sketched here, never implemented (see the deferral note immediately below):**
 
 ```swift
 let job = try await mailer.enqueue(msg)
 let status = await mailer.status(of: job)   // .queued / .sent / .error
 ```
 
-These three shapes (single-shot `send`, batch `send`, two-phase compose/sign/send, and enqueue/status) are the complete public surface of this package. **There is no Lasso-facing entry point here** — see §4.1's correction. §6 documents, purely as reference research for a future, separate Perfect-Lasso-side task, how a `LassoPerfectSMTP`-style adapter (living in the Perfect-Lasso repo, not here) would map Lasso's `email_send` parameter surface onto these same three shapes.
+**`enqueue`/`status` deferral — recorded explicitly (milestone review, architecture pass, fix pass correction).** This section originally sketched `enqueue`/`status` as one of "the complete public surface of this package" alongside the three shapes that actually shipped, which became an inaccurate claim once Phase 0-5 landed without it. To be clear, now that all phases are complete: `enqueue`/`status` was never implemented in any phase, and nothing else in this design assumes it exists — no other phase's architecture, transport, or retry-queue logic depends on an async job-tracking layer being present. It is recorded here as a **deliberate, documented deferral**, matching this plan's established style for the DANE deferral and the MTA-STS stale-cache staleness-ceiling decision (§9, Phase 4): if durable job tracking is wanted in a future library or phase, it needs its own design pass — a persistence model (where job state lives across process restarts), a job-ID scheme, and an explicit decision on its relationship to `DirectMXRetryQueue`'s existing retry-state machine (§4.8/§9 Phase 3) — rather than being treated as a natural, low-effort extension of what shipped. `DirectMXRetryQueue` already gives synchronous callers structured per-recipient retry/expiry state; a durable, restart-surviving job-tracking API is a genuinely different, larger commitment (persistent storage, at minimum) that this rewrite never took on.
+
+The actual, complete public surface of this package is: single-shot `send` (§4.9, above), array batch `send`, streaming `send` (the `AsyncSequence`-based overload, above), and two-phase compose/sign/send — four shapes, not three, correcting this section's original miscount, which also failed to mention the streaming overload documented in detail immediately above it. **There is no Lasso-facing entry point here** — see §4.1's correction. §6 documents, purely as reference research for a future, separate Perfect-Lasso-side task, how a `LassoPerfectSMTP`-style adapter (living in the Perfect-Lasso repo, not here) would map Lasso's `email_send` parameter surface onto these same four shapes.
 
 ## 5. Testing strategy
 

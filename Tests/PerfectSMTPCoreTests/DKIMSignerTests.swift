@@ -88,6 +88,13 @@ struct DKIMSignerTests {
         // Likewise "Bcc" (this signer's deliberate addition to the plan's
         // literal minimum list -- see DKIMSigner.alwaysOversignedHeaders).
         #expect(result.filter { $0 == "bcc" }.count == 1)
+        // FIX #2 (milestone review, Phase 5 fix pass): List-Unsubscribe/
+        // -Post get the same "absent header still gets exactly one phantom
+        // h= entry" treatment as Bcc -- see alwaysOversignedHeaders' doc
+        // comment and RFC 8058 §4's DKIM-coverage requirement for these
+        // two specifically.
+        #expect(result.filter { $0 == "list-unsubscribe" }.count == 1)
+        #expect(result.filter { $0 == "list-unsubscribe-post" }.count == 1)
     }
 
     @Test func effectiveHeaderNamesCoversTheFullPlanMinimumSetEvenWhenAllAbsent() {
@@ -159,6 +166,55 @@ struct DKIMSignerTests {
         // entry now resolves to a REAL header at verification time,
         // changing the hash -- and the signature must no longer verify.
         let tamperedHeaders = originalHeaders + [("Bcc", "attacker@evil.example")]
+        #expect(!Self.verifies(
+            headers: tamperedHeaders, hNames: hNamesAtSigningTime,
+            tagPrefix: tagPrefix, signatureBase64: signatureBase64, publicKey: publicKey
+        ))
+    }
+
+    @Test func oversignedButAbsentListUnsubscribeHeaderInvalidatesSignatureAfterLaterInjection() throws {
+        // Mirrors oversignedButAbsentBccHeaderInvalidatesSignatureAfterLaterInjection
+        // above, extended to FIX #2's List-Unsubscribe addition (RFC 8058
+        // §4's DKIM-coverage requirement for the one-click headers).
+        let originalHeaders: [(name: String, value: String)] = [
+            ("From", "Ops <ops@example.com>"),
+            ("To", "User <user@example.com>"),
+            ("Subject", "Test message"),
+        ]
+        let message = RFC5322Message(headers: originalHeaders, body: Array("hello\r\n".utf8))
+
+        let privateKey = try _RSA.Signing.PrivateKey(pemRepresentation: Self.rsa2048PEM)
+        let signer = try DKIMSigner(
+            domain: "example.com",
+            selector: "s1",
+            signedHeaders: ["from", "to", "subject"],
+            keys: [.rsa(privateKey)],
+            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+        )
+
+        let signed = try signer.sign(message)
+        let dkimHeaderValue = try #require(signed.headers.first { $0.name == "DKIM-Signature" }?.value)
+
+        let hNamesAtSigningTime = DKIMSigner.effectiveHeaderNames(
+            signedHeaders: ["from", "to", "subject"], actualHeaders: originalHeaders
+        )
+        #expect(hNamesAtSigningTime.filter { $0 == "list-unsubscribe" }.count == 1)
+
+        let (tagPrefix, signatureBase64) = try Self.splitOffSignature(dkimHeaderValue)
+        let publicKey = privateKey.publicKey
+
+        #expect(Self.verifies(
+            headers: originalHeaders, hNames: hNamesAtSigningTime,
+            tagPrefix: tagPrefix, signatureBase64: signatureBase64, publicKey: publicKey
+        ))
+
+        // The attack: an attacker (or a downstream relay stripping DKIM's
+        // protection) injects a List-Unsubscribe header that was never
+        // there at signing time -- e.g. to point Gmail/Yahoo's one-click
+        // handler at an attacker-controlled endpoint. The phantom h= entry
+        // now resolves to a REAL header at verification time, changing the
+        // hash, so the signature must no longer verify.
+        let tamperedHeaders = originalHeaders + [("List-Unsubscribe", "<https://attacker.example/unsub>")]
         #expect(!Self.verifies(
             headers: tamperedHeaders, hNames: hNamesAtSigningTime,
             tagPrefix: tagPrefix, signatureBase64: signatureBase64, publicKey: publicKey

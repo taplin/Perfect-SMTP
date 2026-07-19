@@ -107,8 +107,29 @@ public struct DKIMSigner: Sendable, MessageSigner {
     /// it costs exactly one guaranteed-phantom `h=` entry, always -- there
     /// is no present-header case to worry about, only the free defensive
     /// win.
+    ///
+    /// `list-unsubscribe`/`list-unsubscribe-post` are a Phase 5 addition
+    /// (milestone review, two independent passes -- architecture and
+    /// protocol). The architecture review applies the same `bcc` rationale
+    /// above to these: a header this library can normally never emit
+    /// without the caller explicitly setting `EmailMessage.listUnsubscribe`
+    /// is exactly the "guaranteed-phantom, free defensive win" shape. The
+    /// protocol review adds the specific RFC citation -- RFC 8058 §4:
+    /// these headers "MUST be covered by the [DKIM] signature ... If the
+    /// message does not have the required DKIM signature [covering these
+    /// headers], the mail receiver SHOULD NOT offer a one-click
+    /// unsubscribe for that message." Without this addition, a caller who
+    /// enables both DKIM signing and `postOneClick` but forgets to also
+    /// list these names in their own `signedHeaders` gets a message that
+    /// composes fine and verifies fine, but silently fails Gmail/Yahoo's
+    /// actual one-click eligibility check. `Precedence`/`Auto-Submitted`
+    /// are deliberately NOT added here -- they're lower-stakes
+    /// informational headers with no RFC 8058-style DKIM-coverage
+    /// requirement, so the "oversign anything the composer might emit"
+    /// argument is weaker for them than for the two names actually added.
     public static let alwaysOversignedHeaders: [String] = [
         "from", "subject", "to", "cc", "bcc", "date", "reply-to", "sender", "content-type", "mime-version",
+        "list-unsubscribe", "list-unsubscribe-post",
     ]
 
     /// - Parameters:

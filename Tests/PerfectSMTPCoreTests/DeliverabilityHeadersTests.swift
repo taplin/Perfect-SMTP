@@ -100,6 +100,64 @@ struct DeliverabilityHeadersTests {
         }
     }
 
+    // MARK: - FIX #1 (milestone review, protocol pass): RFC 8058 §3.1's
+    // "MUST contain one HTTPS URI" -- checked unconditionally, not only
+    // when postOneClick is true (this composer's always-HTTPS scope
+    // decision; see ComposerError.listUnsubscribeURLMustBeHTTPS).
+
+    @Test func httpURLWithPostOneClickTrueThrows() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(url: "http://example.com/unsub?id=123", postOneClick: true)
+
+        #expect(throws: MIMEComposer.ComposerError.listUnsubscribeURLMustBeHTTPS) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func httpURLWithPostOneClickFalseAlsoThrows() {
+        // This composer's scope decision leans stricter than RFC 8058
+        // §3.1's literal one-click-only "MUST": a plain, non-one-click
+        // `List-Unsubscribe: <http://...>` is still a cleartext-downgrade
+        // risk for whatever token the URL carries, so the HTTPS check
+        // applies unconditionally to `url`, not gated on `postOneClick`.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(url: "http://example.com/unsub?id=123", postOneClick: false)
+
+        #expect(throws: MIMEComposer.ComposerError.listUnsubscribeURLMustBeHTTPS) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func unparsableURLStringAlsoThrowsTheSameHTTPSError() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(url: "not a url at all")
+
+        #expect(throws: MIMEComposer.ComposerError.listUnsubscribeURLMustBeHTTPS) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func genuineHTTPSURLComposesCorrectly() throws {
+        // Confirms the already-covered happy path (bothMailtoAndURLPresentProduceOneCommaSeparatedHeader,
+        // onlyURLPresentEmitsJustTheURLEntry, postOneClickTrueWithURLEmitsTheFixedLiteralHeader,
+        // above) still succeeds now that the HTTPS check is in place -- not duplicating those,
+        // just confirming this fix pass didn't regress the accept path.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(url: "https://example.com/unsub?id=123", postOneClick: true)
+
+        let composed = try MIMEComposer(message).compose()
+        let header = try #require(composed.headers.first { $0.name == "List-Unsubscribe" }?.value)
+        #expect(header == "<https://example.com/unsub?id=123>")
+    }
+
     // MARK: - CRLF-injection rejection (extends Phase 0's bug-regression style)
 
     @Test func mailtoCRLFInjectionAttemptIsRejected() {
@@ -137,6 +195,60 @@ struct DeliverabilityHeadersTests {
         #expect(throws: (any Error).self) {
             _ = try MIMEComposer(message).compose()
         }
+    }
+
+    // MARK: - FIX #3 (milestone review, security pass): List-Unsubscribe's
+    // own list-delimiter characters (<, >, ,) must be rejected, distinct
+    // from the CR/LF line-injection class above.
+
+    @Test func urlContainingListDelimiterCharactersIsRejected() {
+        // A url that stays within one header line (no CR/LF) but splices
+        // an extra, attacker-chosen entry into List-Unsubscribe's own
+        // comma-separated <uri> list -- e.g. a spoofed mailto: target.
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(url: "https://good.example.com/unsub>, <mailto:spoofed@attacker.example")
+
+        #expect(throws: MIMEComposer.ComposerError.listUnsubscribeValueContainsDelimiterCharacter("listUnsubscribe.url")) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    @Test func mailtoContainingListDelimiterCharactersIsRejected() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(mailto: "unsub@example.com>, <mailto:spoofed@attacker.example")
+
+        #expect(throws: MIMEComposer.ComposerError.listUnsubscribeValueContainsDelimiterCharacter("listUnsubscribe.mailto")) {
+            _ = try MIMEComposer(message).compose()
+        }
+    }
+
+    // MARK: - `mailto` already-`mailto:`-prefixed footgun (smaller fix,
+    // robustness pass): the redundant prefix is stripped, not doubled.
+
+    @Test func mailtoAlreadyPrefixedWithSchemeHasTheRedundantPrefixStripped() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(mailto: "mailto:unsub@example.com")
+
+        let composed = try MIMEComposer(message).compose()
+        let header = try #require(composed.headers.first { $0.name == "List-Unsubscribe" }?.value)
+        #expect(header == "<mailto:unsub@example.com>")
+    }
+
+    @Test func mailtoPrefixStrippingIsCaseInsensitive() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.textBody = "hello"
+        message.listUnsubscribe = ListUnsubscribe(mailto: "MAILTO:unsub@example.com")
+
+        let composed = try MIMEComposer(message).compose()
+        let header = try #require(composed.headers.first { $0.name == "List-Unsubscribe" }?.value)
+        #expect(header == "<mailto:unsub@example.com>")
     }
 
     // MARK: - Precedence / Auto-Submitted

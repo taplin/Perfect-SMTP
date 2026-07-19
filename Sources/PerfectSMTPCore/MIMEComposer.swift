@@ -47,6 +47,34 @@ public struct MIMEComposer: Sendable {
         /// opposed to the silent-strip precedent reserved for free-text
         /// fields like Subject/display names).
         case postOneClickRequiresURL
+        /// Milestone review finding (protocol pass, RFC 8058 §3.1 —
+        /// "The List-Unsubscribe header field MUST contain one HTTPS URI"):
+        /// `ListUnsubscribe.url` failed to parse as a URL at all, or parsed
+        /// but its scheme was not `https`. Checked unconditionally whenever
+        /// `url` is set — not only when `postOneClick` is true — since a
+        /// plain (non-one-click) `List-Unsubscribe: <http://…>` target is
+        /// also a cleartext-downgrade risk for whatever unsubscribe token
+        /// it carries, even outside the one-click mechanism RFC 8058 §3.1
+        /// literally addresses. Fails loud rather than silently downgrading
+        /// or dropping the header, matching this composer's established
+        /// caller-misconfiguration precedent (`postOneClickRequiresURL`,
+        /// `forbiddenHeader`).
+        case listUnsubscribeURLMustBeHTTPS
+        /// Milestone review finding (security pass): `<`, `>`, and `,` are
+        /// the delimiter characters RFC 8058/2369 use to structure
+        /// `List-Unsubscribe`'s value as a comma-separated list of `<uri>`
+        /// entries. Left unescaped in a caller-supplied `mailto`/`url`,
+        /// they let a value splice an attacker-chosen extra entry into the
+        /// header's own semantic list (e.g. `"https://good.example/unsub>,
+        /// <mailto:spoofed@attacker.example"` injects a spoofed `mailto:`
+        /// target) — a structural corruption distinct from the CR/LF
+        /// line-injection class `invalidHeaderValue` already covers.
+        /// Narrower in scope than `HeaderEncoder.rejectHeaderInjection`
+        /// deliberately: these three characters are ordinary and often
+        /// legitimate in other header fields (e.g. address angle-bracket
+        /// syntax), so this check is List-Unsubscribe-specific rather than
+        /// a broadening of the general injection check.
+        case listUnsubscribeValueContainsDelimiterCharacter(String)
     }
 
     /// Case-insensitive denylist of header names `extraHeaders` may never
@@ -237,6 +265,30 @@ public struct MIMEComposer: Sendable {
     ///   since a caller who sets `postOneClick` with no `url` has made a
     ///   configuration mistake this composer should surface, not paper
     ///   over (`ComposerError.postOneClickRequiresURL`).
+    /// - `url`, whenever present, MUST be an `https://` URI — checked
+    ///   unconditionally, not only when `postOneClick` is true (milestone
+    ///   review, RFC 8058 §3.1; see `ComposerError.listUnsubscribeURLMustBeHTTPS`'s
+    ///   doc comment for the always-vs-one-click-only scope decision).
+    ///   Parsed with `Foundation.URL(string:)`; a string that fails to
+    ///   parse at all is treated the same as one that parses but isn't
+    ///   `https` — both are a caller configuration error.
+    /// - `mailto`/`url` may not contain `<`, `>`, or `,` — RFC 8058/2369's
+    ///   own list-delimiter characters, which would otherwise splice an
+    ///   extra, attacker-chosen entry into the header's value list
+    ///   (milestone review, security pass; see
+    ///   `ComposerError.listUnsubscribeValueContainsDelimiterCharacter`'s
+    ///   doc comment). Checked in addition to, not instead of, the
+    ///   existing CR/LF-injection check below.
+    /// - A `mailto` value that already starts with the `mailto:` scheme
+    ///   (case-insensitively) has the redundant prefix stripped before the
+    ///   scheme is re-added, rather than producing a doubled-scheme
+    ///   `mailto:mailto:…` URI (milestone review, robustness pass) — `mailto`
+    ///   is documented as the bare mailbox, so this treats the prefixed
+    ///   form as a caller mistake worth silently correcting rather than a
+    ///   hard failure, consistent with this file's existing precedent of
+    ///   reserving `throw` for genuinely ambiguous/dangerous input (CRLF,
+    ///   delimiter splicing) rather than a merely redundant-but-unambiguous
+    ///   one.
     /// - `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is emitted
     ///   verbatim when `postOneClick` is true — this value is a fixed
     ///   literal per RFC 8058 §2, never caller-configurable.
@@ -249,10 +301,13 @@ public struct MIMEComposer: Sendable {
         var entries: [String] = []
         if let mailto = config.mailto {
             try Self.requireNoInjection(mailto, field: "listUnsubscribe.mailto")
-            entries.append("<mailto:\(mailto)>")
+            try Self.requireNoListUnsubscribeDelimiters(mailto, field: "listUnsubscribe.mailto")
+            entries.append("<mailto:\(Self.strippingRedundantMailtoScheme(mailto))>")
         }
         if let url = config.url {
             try Self.requireNoInjection(url, field: "listUnsubscribe.url")
+            try Self.requireNoListUnsubscribeDelimiters(url, field: "listUnsubscribe.url")
+            try Self.requireHTTPSListUnsubscribeURL(url)
             entries.append("<\(url)>")
         }
         guard !entries.isEmpty else { return [] }
@@ -264,6 +319,39 @@ public struct MIMEComposer: Sendable {
             headers.append(("List-Unsubscribe-Post", "List-Unsubscribe=One-Click"))
         }
         return headers
+    }
+
+    /// RFC 8058 §3.1's `mailto`-doesn't-need-a-scheme-prefix convention:
+    /// strips a redundant, caller-supplied `mailto:` prefix (case-
+    /// insensitively) so `listUnsubscribeHeaders()` never emits a doubled
+    /// `mailto:mailto:…` URI.
+    private static func strippingRedundantMailtoScheme(_ mailto: String) -> String {
+        let prefix = "mailto:"
+        guard mailto.lowercased().hasPrefix(prefix) else { return mailto }
+        return String(mailto.dropFirst(prefix.count))
+    }
+
+    /// FIX #3 (milestone review, security pass): rejects the three
+    /// characters (`<`, `>`, `,`) RFC 8058/2369 use to delimit
+    /// `List-Unsubscribe`'s comma-separated `<uri>` list — deliberately
+    /// separate from, and in addition to, `requireNoInjection`'s CR/LF
+    /// check, and deliberately not folded into `HeaderEncoder.rejectHeaderInjection`
+    /// itself (those characters are legitimate in other header fields,
+    /// e.g. address angle-bracket syntax).
+    private static func requireNoListUnsubscribeDelimiters(_ value: String, field: String) throws {
+        guard value.contains(where: { $0 == "<" || $0 == ">" || $0 == "," }) else { return }
+        throw ComposerError.listUnsubscribeValueContainsDelimiterCharacter(field)
+    }
+
+    /// FIX #1 (milestone review, protocol pass): RFC 8058 §3.1 — "The
+    /// List-Unsubscribe header field MUST contain one HTTPS URI." Applied
+    /// unconditionally to `listUnsubscribe.url` whenever it's set, not only
+    /// when `postOneClick` is true — see `ComposerError.listUnsubscribeURLMustBeHTTPS`'s
+    /// doc comment for the scope rationale.
+    private static func requireHTTPSListUnsubscribeURL(_ value: String) throws {
+        guard let url = Foundation.URL(string: value), url.scheme?.lowercased() == "https" else {
+            throw ComposerError.listUnsubscribeURLMustBeHTTPS
+        }
     }
 
     // MARK: - Tree construction
