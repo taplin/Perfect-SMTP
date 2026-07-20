@@ -29,10 +29,13 @@ operate mail, or let Perfect-SMTP be the terminal MTA itself.
 
 This package is part of the [Perfect-Resurrection](https://github.com/taplin)
 ecosystem and is domain-agnostic by design — it has no Lasso-specific code
-and no Lasso dependency. It is, however, a **core, live dependency**:
-[Perfect-Lasso](https://github.com/taplin/Perfect-Lasso) depends on this
-package directly to implement its production `email_send` tag, which sends
-real outbound email for the site. (There is a separate, unrelated
+and no Lasso dependency. It is, however, a **core dependency**:
+[Perfect-Lasso](https://github.com/taplin/Perfect-Lasso) — a Swift
+reimplementation of the Lasso language, still in active development and
+not yet production-ready, though validated against real code from
+multiple production e-commerce sites — depends on this package directly
+to implement its `email_send` tag, which sends real outbound email during
+that validation testing. (There is a separate, unrelated
 in-progress target called `LassoPerfectSMTP` being built *inside* the
 Perfect-Lasso repo on another branch — that is not this package and does not
 depend on it.)
