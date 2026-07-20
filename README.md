@@ -1,27 +1,6 @@
 # Perfect - SMTP [简体中文](README.zh_CN.md)
 
 <p align="center">
-    <a href="http://perfect.org/get-involved.html" target="_blank">
-        <img src="http://perfect.org/assets/github/perfect_github_2_0_0.jpg" alt="Get Involed with Perfect!" width="854" />
-    </a>
-</p>
-
-<p align="center">
-    <a href="https://github.com/PerfectlySoft/Perfect" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_1_Star.jpg" alt="Star Perfect On Github" />
-    </a>
-    <a href="http://stackoverflow.com/questions/tagged/perfect" target="_blank">
-        <img src="http://www.perfect.org/github/perfect_gh_button_2_SO.jpg" alt="Stack Overflow" />
-    </a>
-    <a href="https://twitter.com/perfectlysoft" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_3_twit.jpg" alt="Follow Perfect on Twitter" />
-    </a>
-    <a href="http://perfect.ly" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_4_slack.jpg" alt="Join the Perfect Slack" />
-    </a>
-</p>
-
-<p align="center">
     <a href="https://www.swift.org/" target="_blank">
         <img src="https://img.shields.io/badge/Swift-6.2-orange.svg?style=flat" alt="Swift 6.2">
     </a>
@@ -30,9 +9,6 @@
     </a>
     <a href="LICENSE" target="_blank">
         <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg?style=flat" alt="License Apache 2.0">
-    </a>
-    <a href="http://twitter.com/PerfectlySoft" target="_blank">
-        <img src="https://img.shields.io/badge/Twitter-@PerfectlySoft-blue.svg?style=flat" alt="PerfectlySoft Twitter">
     </a>
 </p>
 
@@ -50,6 +26,16 @@ operate mail, or let Perfect-SMTP be the terminal MTA itself.
 > you used the old `EMail`/`SMTPClient`/`Recipient` API, see
 > [Migrating from the old Perfect-SMTP](Documentation/user-guide.md#migrating-from-the-old-perfect-smtp)
 > in the user guide — this is not a drop-in upgrade.
+
+This package is part of the [Perfect-Resurrection](https://github.com/taplin)
+ecosystem and is domain-agnostic by design — it has no Lasso-specific code
+and no Lasso dependency. It is, however, a **core, live dependency**:
+[Perfect-Lasso](https://github.com/taplin/Perfect-Lasso) depends on this
+package directly to implement its production `email_send` tag, which sends
+real outbound email for the site. (There is a separate, unrelated
+in-progress target called `LassoPerfectSMTP` being built *inside* the
+Perfect-Lasso repo on another branch — that is not this package and does not
+depend on it.)
 
 ## Features
 
@@ -87,10 +73,13 @@ For anything beyond the basics below, see the
 
 ## Installation
 
-Add the package to your `Package.swift`:
+Add the package to your `Package.swift`. This fork lives at
+`taplin/Perfect-SMTP`, not the original `PerfectlySoft/Perfect-SMTP`, and has
+no tagged releases yet, so pin a branch or a specific commit rather than a
+version range:
 
 ```swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "6.0.0")
+.package(url: "https://github.com/taplin/Perfect-SMTP.git", branch: "main")
 ```
 
 and depend on the `PerfectSMTP` product (it re-exports `PerfectSMTPCore`,
@@ -151,11 +140,11 @@ authentication options, bulk sending, and deliverability headers, see the
 swift test
 ```
 
-All 323 tests run with no external services and no environment variables —
-this includes tests that open real loopback sockets (a STARTTLS handshake
-and a full DirectMX delivery each run against an in-process fake SMTP
-server on `127.0.0.1`), but nothing here talks to the real network or a
-real mail server.
+346 tests (188 in `PerfectSMTPTests`, 158 in `PerfectSMTPCoreTests`) run with
+no external services and no environment variables — this includes tests
+that open real loopback sockets (a STARTTLS handshake and a full DirectMX
+delivery each run against an in-process fake SMTP server on `127.0.0.1`),
+but nothing here talks to the real network or a real mail server.
 
 Note: the original rewrite plan (`Documentation/swift6-nio-rewrite-plan.md`
 §4.1/§5) describes an additional `SMTP_TESTS=1`-gated live-integration tier
