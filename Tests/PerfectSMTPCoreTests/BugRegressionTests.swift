@@ -270,4 +270,30 @@ struct BugRegressionTests {
         // characteristic was that composition *succeeded* and silently
         // included the injected header line.
     }
+
+    // MARK: - Bug #1 class, new vector: EmailMessage.charset CRLF injection
+    //
+    // LassoPerfectSMTP milestone review finding (security pass): unlike
+    // `bodyContentTypeOverride` above, the *default* (non-override)
+    // `Content-Type` construction path in `textLeaf` interpolated
+    // `self.charset` (sourced from `EmailMessage.charset`, i.e. Lasso's
+    // `-characterSet` dash-param) directly into the header string with no
+    // `requireNoInjection` check at all -- a caller-supplied charset
+    // containing CR/LF reached a live extra header, the same injection
+    // shape as `bodyContentTypeOverride`'s already-covered vector, just on
+    // the sibling code path that never got the same fix.
+
+    @Test func finding6_charsetCRLFInjectionAttemptIsRejectedNotSilentlyEmbedded() {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        message.charset = "utf-8\r\nBcc: attacker@evil.com"
+
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("charset")) {
+            _ = try MIMEComposer(message).compose()
+        }
+
+        // As with finding #5: there is no serialized message to inspect --
+        // composition throwing before producing one is itself the
+        // assertion that no live extra header was ever embedded.
+    }
 }

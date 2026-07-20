@@ -487,6 +487,19 @@ public struct MIMEComposer: Sendable {
             try Self.requireUTF8CharsetIfPresent(override)
             contentType = override
         } else {
+            // Milestone review finding (security pass): `charset` (from
+            // `EmailMessage.charset`, i.e. Lasso's `-characterSet`) reaches
+            // this default `Content-Type` header exactly like `override`
+            // does above, but was never routed through
+            // `requireNoInjection` -- a caller-supplied charset containing
+            // CR/LF was embedded verbatim, letting a value like
+            // `"utf-8\r\nBcc: attacker@evil.com"` inject an arbitrary extra
+            // header. `bodyContentTypeOverride` already got this exact
+            // protection when it was added; this closes the same gap for
+            // the non-override (default) path, so `EmailMessage.charset`
+            // is protected for every caller, not just ones that also set
+            // an override.
+            try Self.requireNoInjection(charset, field: "charset")
             contentType = "text/\(subtype); charset=\(charset)"
         }
 
