@@ -181,6 +181,64 @@ public struct DKIMSigner: Sendable, MessageSigner {
         self.now = now
     }
 
+    /// Trusted, non-throwing designated init used only by
+    /// `signingAdditionalHeaders(_:)` below to cheaply rebuild a copy of
+    /// an already-validated signer with a different `signedHeaders` list.
+    /// `domain`/`selector`/`keys` are taken verbatim from a signer that
+    /// already passed the throwing `init`'s validation, so re-validating
+    /// them here would be redundant, not protective -- this is a plain
+    /// value copy, not a new trust boundary. The unused `trusted` label
+    /// exists only to give this initializer a distinct signature from the
+    /// public throwing one above (Swift resolves overloads by parameter
+    /// list, not by `throws`).
+    private init(
+        domain: String,
+        selector: String,
+        signedHeaders: [String],
+        canon: (header: Mode, body: Mode),
+        keys: [SigningKey],
+        now: @escaping @Sendable () -> Date,
+        trusted: Void
+    ) {
+        self.domain = domain
+        self.selector = selector
+        self.signedHeaders = signedHeaders
+        self.canon = canon
+        self.keys = keys
+        self.now = now
+    }
+
+    /// Returns a copy of this signer whose `signedHeaders` base set also
+    /// includes `additionalHeaderNames` -- milestone review finding
+    /// (LassoPerfectSMTP Phase F, protocol pass): `signedHeaders` is fixed
+    /// at construction time, but `-extraMIMEHeaders`-style custom header
+    /// names are a *per-message* concern (different messages may add
+    /// different custom header names), so a signer built once at server
+    /// startup with a static `signedHeaders: []` can never cover them --
+    /// they'd be present in the composed message but absent from `h=`,
+    /// giving an on-path party a way to tamper with a custom header
+    /// without invalidating the signature.
+    ///
+    /// Cheap to call once per outgoing message: reconstructing a
+    /// `DKIMSigner` does no cryptographic work at all -- `domain`/
+    /// `selector`/`keys` are copied verbatim (no re-validation, see the
+    /// trusted init above), so this is just an array copy plus a few
+    /// `Sendable` closure/struct copies, nothing that scales with key size
+    /// or message count. Safe for a caller (e.g. `SMTPMailer.composeAndSign`)
+    /// to call unconditionally before every `sign(_:)`.
+    public func signingAdditionalHeaders(_ additionalHeaderNames: [String]) -> DKIMSigner {
+        guard !additionalHeaderNames.isEmpty else { return self }
+        return DKIMSigner(
+            domain: domain,
+            selector: selector,
+            signedHeaders: signedHeaders + additionalHeaderNames,
+            canon: canon,
+            keys: keys,
+            now: now,
+            trusted: ()
+        )
+    }
+
     /// Conforms `DKIMSigner` to `PerfectSMTPCore/MessageSigner.swift`'s
     /// seam -- the Phase 1 protocol `SMTPMailer` is already built against.
     /// Computes and prepends one `DKIM-Signature` header per configured

@@ -376,7 +376,27 @@ public struct SMTPMailer: Sendable {
         let composed = try MIMEComposer(message).compose()
         let finalMessage: RFC5322Message
         if let signer {
-            finalMessage = try signer.sign(composed)
+            // Milestone review finding (LassoPerfectSMTP Phase F, protocol
+            // pass): a `DKIMSigner` built once (e.g. at server startup)
+            // with a fixed `signedHeaders` list has no way to cover
+            // `message.extraHeaders`' names, which are a per-message
+            // concern -- different `EmailMessage`s may add different
+            // custom header names. Widening `signedHeaders` here, right
+            // before signing, closes that gap for every caller of
+            // `EmailMessage.extraHeaders` + `DKIMSigner`, not just one
+            // adapter. Cheap (see `signingAdditionalHeaders`'s doc
+            // comment) and a no-op both when there's no `DKIMSigner`
+            // configured (a plain `MessageSigner` doesn't get this
+            // treatment -- there's no generic protocol-level way to widen
+            // an arbitrary signer's covered headers) and when the message
+            // has no `extraHeaders` at all.
+            let effectiveSigner: any MessageSigner
+            if let dkim = signer as? DKIMSigner {
+                effectiveSigner = dkim.signingAdditionalHeaders(message.extraHeaders.map(\.name))
+            } else {
+                effectiveSigner = signer
+            }
+            finalMessage = try effectiveSigner.sign(composed)
             // DMARC-alignment lint (plan §4.6): a type-check against the
             // concrete `DKIMSigner`, not a `MessageSigner` protocol
             // requirement -- keeping the alignment check itself as pure

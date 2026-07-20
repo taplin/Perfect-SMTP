@@ -79,6 +79,52 @@ struct SMTPMailerDKIMIntegrationTests {
         #expect(headerBlock.contains("s=s1"))
     }
 
+    // Milestone review finding (LassoPerfectSMTP Phase F, protocol pass):
+    // `signedHeaders` is fixed at signer-construction time, so a signer
+    // built with an empty (or otherwise fixed) base set -- relying purely
+    // on `DKIMSigner.alwaysOversignedHeaders` -- previously gave a
+    // message's `extraHeaders` (Lasso's `-extraMIMEHeaders`) zero DKIM
+    // coverage: they're present in the composed message but absent from
+    // `h=`, so an on-path party could tamper with a custom header
+    // without invalidating the signature. `SMTPMailer.composeAndSign`
+    // now widens the signer's `signedHeaders` with the message's own
+    // `extraHeaders` names (`DKIMSigner.signingAdditionalHeaders`) right
+    // before signing -- this proves that actually happens end-to-end.
+    @Test func messageWithExtraMIMEHeadersGetsThemCoveredByTheDKIMSignaturesHTag() async throws {
+        let capture = CapturingTransport()
+        let signer = try DKIMSigner(
+            domain: "example.com",
+            selector: "s1",
+            signedHeaders: [],
+            keys: [try SigningKey.rsa(pem: Self.rsa2048PEM)]
+        )
+        let mailer = SMTPMailer(transport: capture, signer: signer)
+
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@dest.com")]
+        message.subject = "Hello"
+        message.textBody = "hi there"
+        message.extraHeaders = [("X-Campaign-ID", "spring-sale-42")]
+
+        _ = try await mailer.send(message, envelopeFrom: .address("bounce@example.com"))
+
+        let sent = try #require(await capture.lastMessage)
+        let serialized = String(decoding: sent.rfc5322, as: UTF8.self)
+        let headerBlock = try #require(serialized.components(separatedBy: "\r\n\r\n").first)
+
+        // The custom header must actually be present in the composed
+        // message (sanity check that this test exercises a real gap, not
+        // a no-op)...
+        #expect(headerBlock.contains("X-Campaign-ID: spring-sale-42"))
+        // ...and the DKIM-Signature's own `h=` tag must list its name,
+        // proving it's actually covered by the signature, not just
+        // present alongside it.
+        let dkimLine = try #require(headerBlock.components(separatedBy: "\r\n").first { $0.hasPrefix("DKIM-Signature:") })
+        let hTag = try #require(dkimLine.components(separatedBy: "; ").first { $0.hasPrefix("h=") })
+        let signedNames = hTag.dropFirst("h=".count).split(separator: ":").map { $0.lowercased() }
+        #expect(signedNames.contains("x-campaign-id"))
+    }
+
     @Test func mailerWithoutASignerStillSendsUnsignedExactlyAsInPhase1() async throws {
         let capture = CapturingTransport()
         let mailer = SMTPMailer(transport: capture)
