@@ -9,6 +9,7 @@
 //  and cancellation, which the array-based overload has no equivalent of.
 //
 
+import Foundation
 import Testing
 @testable import PerfectSMTP
 
@@ -99,7 +100,7 @@ struct SMTPMailerStreamingSendTests {
         // Deliberately never touch `stream` for a while -- this is the
         // "consumer isn't draining" scenario the backpressure requirement
         // is about.
-        try await Task.sleep(for: .milliseconds(150))
+        try await Task.sleep(nanoseconds: UInt64(150) * 1_000_000)
 
         let stalledCount = await tracker.totalSends
         #expect(stalledCount < totalMessages)
@@ -127,7 +128,7 @@ struct SMTPMailerStreamingSendTests {
         let tracker = StreamingInFlightTracker()
         // A per-send delay long enough that the test can reliably cancel
         // mid-flight and observe the count stop changing afterward.
-        let transport = StreamingCountingTransport(tracker: tracker, perSendDelay: .milliseconds(20))
+        let transport = StreamingCountingTransport(tracker: tracker, perSendDelay: 0.020)
         let mailer = SMTPMailer(transport: transport, configuration: .init(maxInFlightBatchSends: cap))
 
         let source = messageSequence(count: 100_000)
@@ -139,16 +140,16 @@ struct SMTPMailerStreamingSendTests {
         }
 
         // Let a handful of sends actually happen, then cancel.
-        try await Task.sleep(for: .milliseconds(60))
+        try await Task.sleep(nanoseconds: UInt64(60) * 1_000_000)
         consumer.cancel()
 
         // Give the cancellation-aware pipeline a moment to actually wind
         // down (in-flight sends complete, `startNextIfPossible` stops
         // advancing the source iterator).
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(nanoseconds: UInt64(100) * 1_000_000)
         let countShortlyAfterCancel = await tracker.totalSends
 
-        try await Task.sleep(for: .milliseconds(200))
+        try await Task.sleep(nanoseconds: UInt64(200) * 1_000_000)
         let countMuchLaterAfterCancel = await tracker.totalSends
 
         // The defining assertion: production stopped -- it did not keep
@@ -164,7 +165,7 @@ struct SMTPMailerStreamingSendTests {
         // task-cancellation path above.
         let cap = 4
         let tracker = StreamingInFlightTracker()
-        let transport = StreamingCountingTransport(tracker: tracker, perSendDelay: .milliseconds(20))
+        let transport = StreamingCountingTransport(tracker: tracker, perSendDelay: 0.020)
         let mailer = SMTPMailer(transport: transport, configuration: .init(maxInFlightBatchSends: cap))
 
         let source = messageSequence(count: 100_000)
@@ -177,10 +178,10 @@ struct SMTPMailerStreamingSendTests {
             // `StreamLifetimeToken`) should be released shortly after.
         }
 
-        try await Task.sleep(for: .milliseconds(150))
+        try await Task.sleep(nanoseconds: UInt64(150) * 1_000_000)
         let countShortlyAfter = await tracker.totalSends
 
-        try await Task.sleep(for: .milliseconds(200))
+        try await Task.sleep(nanoseconds: UInt64(200) * 1_000_000)
         let countMuchLaterAfter = await tracker.totalSends
 
         #expect(countMuchLaterAfter == countShortlyAfter)
@@ -224,13 +225,13 @@ private actor StreamingInFlightTracker {
 /// socket.
 private struct StreamingCountingTransport: SMTPTransport {
     let tracker: StreamingInFlightTracker
-    var perSendDelay: Duration = .zero
+    var perSendDelay: TimeInterval = 0
 
     func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
         await tracker.enter()
-        if perSendDelay > .zero {
+        if perSendDelay > 0 {
             do {
-                try await Task.sleep(for: perSendDelay)
+                try await Task.sleep(nanoseconds: UInt64(perSendDelay * 1_000_000_000))
             } catch {
                 await tracker.exit()
                 throw error

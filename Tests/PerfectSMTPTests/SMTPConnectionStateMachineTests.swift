@@ -304,7 +304,7 @@ struct SMTPConnectionStateMachineTests {
         // timeout race uses real `Task.sleep`, so a short real-time value
         // is sufficient and needs no `advanceTime` choreography) and a
         // server double that never sends anything at all.
-        let (connection, _channel) = try await ConnectionHarness.make(replyTimeout: .milliseconds(100))
+        let (connection, _channel) = try await ConnectionHarness.make(replyTimeout: 0.1)
         _ = _channel // the scripted "server" side is intentionally silent
 
         let outcome = await resultOf { try await connection.nextReply() }
@@ -330,7 +330,7 @@ struct SMTPConnectionStateMachineTests {
             configuration: .init(maxPerHost: 1, maxTotal: 10),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, _) = try await ConnectionHarness.make(replyTimeout: .milliseconds(100))
+                let (connection, _) = try await ConnectionHarness.make(replyTimeout: 0.1)
                 return connection
             }
         )

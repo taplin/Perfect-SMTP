@@ -96,7 +96,7 @@ public actor DirectMXRetryQueue {
         /// conventional MTA give-up behavior (e.g. Postfix's
         /// `maximal_queue_lifetime` defaults to 5 days) -- plan §4.8's
         /// "~4-5 days" guidance.
-        public var maxAge: Duration
+        public var maxAge: TimeInterval
         /// FIX #6 (LOW-MEDIUM security, milestone security review): a hard
         /// ceiling on how many entries this queue will hold pending at
         /// once, regardless of how many distinct, transiently-failing
@@ -120,7 +120,7 @@ public actor DirectMXRetryQueue {
         public init(
             backoff: RetryBackoffPolicy = .init(),
             maxAttempts: Int = 10,
-            maxAge: Duration = .seconds(5 * 24 * 3600),
+            maxAge: TimeInterval = 5 * 24 * 3600,
             maxTotalEntries: Int = 10_000
         ) {
             self.backoff = backoff
@@ -143,7 +143,7 @@ public actor DirectMXRetryQueue {
         /// either ceiling and must become `.expired` instead of being
         /// rescheduled again.
         func isPastCeiling(attempt: Int, firstQueuedAt: Date) -> Bool {
-            attempt > maxAttempts || Date().timeIntervalSince(firstQueuedAt) >= maxAge.timeIntervalValue
+            attempt > maxAttempts || Date().timeIntervalSince(firstQueuedAt) >= maxAge
         }
     }
 
@@ -387,7 +387,7 @@ public actor DirectMXRetryQueue {
             currentSleepTarget = sleepUntil
             let interval = max(0, sleepUntil.timeIntervalSinceNow)
             do {
-                try await Task.sleep(for: .seconds(interval))
+                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             } catch {
                 // Cancelled -- either `shutdown()` or a `nudgeLoop` restart
                 // for an earlier-arriving entry. Nothing to do in the

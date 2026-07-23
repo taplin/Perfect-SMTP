@@ -156,7 +156,7 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         /// legitimately decommissioned MTA-STS during that window instead
         /// reverts to policy-less and delivery can proceed against
         /// whatever its current, real MX hosts are.
-        public var staleCacheCeiling: Duration
+        public var staleCacheCeiling: TimeInterval
         /// FIX #4 (MEDIUM security, milestone security review): a hard
         /// ceiling on how many distinct domains' policies this actor will
         /// cache at once -- mirroring
@@ -199,7 +199,7 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         /// elapsed does `policy(for:)` spend one TXT lookup confirming the
         /// `id` hasn't changed before continuing to trust the cached
         /// policy body.
-        public var idRecheckInterval: Duration
+        public var idRecheckInterval: TimeInterval
         /// FIX D (protocol review, option (a)): mirrors `DirectMXConfig
         /// .allowPrivateAddresses` for the MTA-STS HTTPS fetch target --
         /// `false` (filtering on) by default, since the same "attacker
@@ -212,9 +212,9 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         public var allowPrivateAddresses: Bool
 
         public init(
-            staleCacheCeiling: Duration = .seconds(5 * 24 * 3600),
+            staleCacheCeiling: TimeInterval = 5 * 24 * 3600,
             maxCacheEntries: Int = 10_000,
-            idRecheckInterval: Duration = .seconds(24 * 3600),
+            idRecheckInterval: TimeInterval = 24 * 3600,
             allowPrivateAddresses: Bool = false
         ) {
             self.staleCacheCeiling = staleCacheCeiling
@@ -311,7 +311,7 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         // *unless* FIX B's id-recheck cadence is due (see below), in which
         // case it costs at most one TXT lookup, never an HTTPS fetch.
         if let cached = cache[domain], cached.expiresAt > currentTime {
-            let recheckDue = currentTime.timeIntervalSince(cached.lastIDCheckedAt) >= configuration.idRecheckInterval.timeIntervalValue
+            let recheckDue = currentTime.timeIntervalSince(cached.lastIDCheckedAt) >= configuration.idRecheckInterval
             if !recheckDue {
                 return cached.policy
             }
@@ -363,7 +363,7 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
 
         do {
             let fetched = try await fetchAndParsePolicy(domain: domain)
-            let expiresAt = currentTime.addingTimeInterval(fetched.policy.maxAge.timeIntervalValue)
+            let expiresAt = currentTime.addingTimeInterval(fetched.policy.maxAge)
             insertIntoCache(domain: domain, fetched: fetched, expiresAt: expiresAt, fetchedAt: currentTime)
             return fetched.policy
         } catch {
@@ -408,7 +408,7 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
             // by more than `staleCacheCeiling`.
             guard let cached = cache[domain] else { return nil }
             let staleSince = currentTime.timeIntervalSince(cached.expiresAt)
-            guard staleSince <= configuration.staleCacheCeiling.timeIntervalValue else {
+            guard staleSince <= configuration.staleCacheCeiling else {
                 cache.removeValue(forKey: domain)
                 return nil
             }

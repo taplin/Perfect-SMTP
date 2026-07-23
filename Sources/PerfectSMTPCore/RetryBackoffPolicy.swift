@@ -33,18 +33,18 @@ public struct RetryBackoffPolicy: Sendable {
     /// longer than `greylist` -- retrying an overloaded receiver quickly is
     /// exactly the aggressive-reconnection behavior that makes the
     /// overload worse (plan §4.8's 421-vs-greylist correction).
-    public var serviceUnavailable: Duration
+    public var serviceUnavailable: TimeInterval
     /// Backoff after a first-contact greylist response (`450`/`451`/`452`)
     /// -- a normal, expected pattern from many receivers, not a failure
     /// signal.
-    public var greylist: Duration
+    public var greylist: TimeInterval
     /// Backoff for any other `4yz` not covered above.
-    public var defaultTransient: Duration
+    public var defaultTransient: TimeInterval
 
     public init(
-        serviceUnavailable: Duration = .seconds(900),
-        greylist: Duration = .seconds(300),
-        defaultTransient: Duration = .seconds(120)
+        serviceUnavailable: TimeInterval = 900,
+        greylist: TimeInterval = 300,
+        defaultTransient: TimeInterval = 120
     ) {
         self.serviceUnavailable = serviceUnavailable
         self.greylist = greylist
@@ -60,23 +60,12 @@ public struct RetryBackoffPolicy: Sendable {
     /// correctly-backed-off retry hint either way.
     public func classify(_ reply: SMTPReply, attempt: Int) -> DeliveryResult.Outcome {
         guard reply.replyClass != .permanentNegative else { return .permanentlyFailed(reply) }
-        let backoff: Duration
+        let backoff: TimeInterval
         switch SMTPError.classify(reply) {
         case .serviceUnavailable: backoff = serviceUnavailable
         case .greylisted: backoff = greylist
         default: backoff = defaultTransient
         }
-        return .queuedForRetry(nextAttempt: Date().addingTimeInterval(backoff.timeIntervalValue), attempt: attempt, last: reply)
-    }
-}
-
-extension Duration {
-    /// `Duration` has no built-in conversion back to `Foundation.TimeInterval`
-    /// (only the reverse, via `.seconds(Double)`) -- used to compute
-    /// `Date.addingTimeInterval`-compatible offsets from a configured
-    /// backoff `Duration`.
-    public var timeIntervalValue: TimeInterval {
-        let c = components
-        return TimeInterval(c.seconds) + TimeInterval(c.attoseconds) / 1e18
+        return .queuedForRetry(nextAttempt: Date().addingTimeInterval(backoff), attempt: attempt, last: reply)
     }
 }

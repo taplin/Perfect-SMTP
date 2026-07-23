@@ -151,7 +151,7 @@ struct LocalMTATransportTests {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask { try await body() }
             group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
+                try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
                 throw DeadlockGuardError.timedOut
             }
             let result = try await group.next()!
@@ -169,7 +169,7 @@ struct LocalMTATransportTests {
         let scriptURL = try makeFakeMTA(stderrBytes: 256 * 1024)
         defer { try? FileManager.default.removeItem(at: scriptURL) }
 
-        let transport = LocalMTATransport(config: LocalMTAConfig(executablePath: scriptURL.path, processTimeout: .seconds(15)))
+        let transport = LocalMTATransport(config: LocalMTAConfig(executablePath: scriptURL.path, processTimeout: 15))
         let envelope = try SMTPEnvelope(mailFrom: .address("from@example.com"), recipients: ["to@example.com"])
         // A non-trivial body so the stdin-write side also has real work to
         // do concurrently with the pipe-filling stdout/stderr writer.

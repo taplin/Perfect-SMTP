@@ -50,14 +50,14 @@ struct SMTPConnectionPoolTests {
         // first `await`, in the same actor activation -- so only one
         // dial should ever be in flight at a time.
         async let first: Void = pool.withConnection(to: key) { _ in
-            try await Task.sleep(for: .milliseconds(50))
+            try await Task.sleep(nanoseconds: UInt64(50) * 1_000_000)
         }
         async let second: Void = pool.withConnection(to: key) { _ in
-            try await Task.sleep(for: .milliseconds(50))
+            try await Task.sleep(nanoseconds: UInt64(50) * 1_000_000)
         }
 
         // Give both tasks a chance to reach `checkout`.
-        try await Task.sleep(for: .milliseconds(20))
+        try await Task.sleep(nanoseconds: UInt64(20) * 1_000_000)
         #expect(await dialGate.concurrentDialCount <= 1)
         await dialGate.release()
 
@@ -77,14 +77,14 @@ struct SMTPConnectionPoolTests {
                 await releaseGate.wait()
             }
         }
-        try await Task.sleep(for: .milliseconds(20)) // let the holder actually check out
+        try await Task.sleep(nanoseconds: UInt64(20) * 1_000_000) // let the holder actually check out
 
         // Park a second checkout as a waiter, then cancel it before the
         // slot ever frees up.
         let waiterTask = Task {
             try await pool.withConnection(to: key) { _ in () }
         }
-        try await Task.sleep(for: .milliseconds(20)) // let it park as a waiter
+        try await Task.sleep(nanoseconds: UInt64(20) * 1_000_000) // let it park as a waiter
         waiterTask.cancel()
 
         let waiterResult = await waiterTask.result

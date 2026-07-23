@@ -105,8 +105,8 @@ enum ConnectionHarness {
     /// (`Task.sleep`-based, not tied to `NIOAsyncTestingEventLoop`'s virtual
     /// clock, so no `advanceTime` dance is needed to observe it fire).
     static func make(
-        replyTimeout: Duration = .seconds(300),
-        dataTerminationTimeout: Duration = .seconds(600)
+        replyTimeout: TimeInterval = 300,
+        dataTerminationTimeout: TimeInterval = 600
     ) async throws -> (SMTPConnection, NIOAsyncTestingChannel) {
         let testingChannel = NIOAsyncTestingChannel()
         try await testingChannel.testingEventLoop.executeInContext {

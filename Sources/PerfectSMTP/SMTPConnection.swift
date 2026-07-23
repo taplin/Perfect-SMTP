@@ -71,7 +71,7 @@ public final class SMTPConnection: @unchecked Sendable {
     /// a phase-specific value through every call site was judged too
     /// invasive for this fix pass, except for the one place it matters most
     /// (see `dataTerminationTimeout` below).
-    private let replyTimeout: Duration
+    private let replyTimeout: TimeInterval
     /// FIX #4's phase-specific exception: RFC 5321 §4.5.3.2 specifies a
     /// *longer* minimum timeout (10 minutes) specifically for the client
     /// waiting on the final reply after the DATA-terminating `<CRLF>.<CRLF>`
@@ -79,7 +79,7 @@ public final class SMTPConnection: @unchecked Sendable {
     /// a large message) that legitimately takes longer than an ordinary
     /// command round-trip. Used only in `sendBodyAndFinalize`'s final-reply
     /// wait; every other command uses `replyTimeout`.
-    private let dataTerminationTimeout: Duration
+    private let dataTerminationTimeout: TimeInterval
     /// FIX (plan §4.8, Phase 3 follow-through on Phase 1's own deferred
     /// item): the 421-vs-greylist-vs-other-4yz backoff durations applied by
     /// `outcomeFor` below. Defaults to the exact values Phase 1 originally
@@ -95,8 +95,8 @@ public final class SMTPConnection: @unchecked Sendable {
     public init(
         asyncChannel: NIOAsyncChannel<SMTPReply, SMTPCommand>,
         ehloHostname: String,
-        replyTimeout: Duration = .seconds(300),
-        dataTerminationTimeout: Duration = .seconds(600),
+        replyTimeout: TimeInterval = 300,
+        dataTerminationTimeout: TimeInterval = 600,
         backoffPolicy: RetryBackoffPolicy = .init()
     ) {
         self.channel = asyncChannel.channel
@@ -142,13 +142,13 @@ public final class SMTPConnection: @unchecked Sendable {
     /// return on that cancellation actually completing, same as the
     /// existing precedent.
     private func raceAgainstTimeout<T: Sendable>(
-        _ timeout: Duration,
+        _ timeout: TimeInterval,
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { race in
             race.addTask { try await operation() }
             race.addTask {
-                try await Task.sleep(for: timeout)
+                try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
                 throw SMTPConnectionError.replyTimedOut
             }
             defer { race.cancelAll() }

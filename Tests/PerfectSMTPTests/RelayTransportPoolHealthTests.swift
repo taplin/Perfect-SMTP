@@ -22,7 +22,7 @@ struct RelayTransportPoolHealthTests {
     private func relayConfig(circuitBreakerThreshold: Int) -> RelayConfig {
         RelayConfig(
             host: "relay.example.com", port: 587, tls: .none,
-            pool: .init(circuitBreakerThreshold: circuitBreakerThreshold, circuitBreakerResetTimeout: .seconds(30))
+            pool: .init(circuitBreakerThreshold: circuitBreakerThreshold, circuitBreakerResetTimeout: 30)
         )
     }
 

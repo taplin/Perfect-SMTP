@@ -21,7 +21,7 @@ struct MTASTSPolicyParsingTests {
         let policy = try #require(MTASTSPolicyParser.parse(text))
         #expect(policy.mode == .enforce)
         #expect(policy.mxPatterns == ["mail.example.com", "*.mail.example.com"])
-        #expect(policy.maxAge == .seconds(604_800))
+        #expect(policy.maxAge == 604_800)
     }
 
     @Test func parsesAWellFormedTestingPolicy() throws {

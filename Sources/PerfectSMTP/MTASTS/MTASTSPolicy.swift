@@ -66,11 +66,11 @@ public struct MTASTSPolicy: Sendable, Equatable {
     /// `enforce`/`testing` handling already treats correctly as "no
     /// candidate host").
     public let mxPatterns: [String]
-    /// RFC 8461 §3.2 `max_age`, in seconds, as a `Duration` --
+    /// RFC 8461 §3.2 `max_age`, in seconds --
     /// `MTASTSPolicyManager`'s cache expiry window for this policy.
-    public let maxAge: Duration
+    public let maxAge: TimeInterval
 
-    public init(mode: MTASTSMode, mxPatterns: [String], maxAge: Duration) {
+    public init(mode: MTASTSMode, mxPatterns: [String], maxAge: TimeInterval) {
         self.mode = mode
         self.mxPatterns = mxPatterns
         self.maxAge = maxAge
@@ -143,6 +143,6 @@ public enum MTASTSPolicyParser {
         guard let mode else { return nil }
         guard let maxAgeSeconds, (0...maximumMaxAgeSeconds).contains(maxAgeSeconds) else { return nil }
 
-        return MTASTSPolicy(mode: mode, mxPatterns: mxPatterns, maxAge: .seconds(maxAgeSeconds))
+        return MTASTSPolicy(mode: mode, mxPatterns: mxPatterns, maxAge: TimeInterval(maxAgeSeconds))
     }
 }
