@@ -38,12 +38,12 @@ public struct LocalMTAConfig: Sendable {
     /// interface (matches `SMTPEnvelope.recipients` being the sole source
     /// of truth for who receives the message, header content aside).
     public var extraArguments: [String]
-    public var processTimeout: Duration
+    public var processTimeout: TimeInterval
 
     public init(
         executablePath: String = "/usr/sbin/sendmail",
         extraArguments: [String] = ["-i"],
-        processTimeout: Duration = .seconds(60)
+        processTimeout: TimeInterval = 60
     ) {
         self.executablePath = executablePath
         self.extraArguments = extraArguments
@@ -158,7 +158,7 @@ public actor LocalMTATransport: SMTPTransport {
         executablePath: String,
         arguments: [String],
         input: [UInt8],
-        timeout: Duration
+        timeout: TimeInterval
     ) async throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
@@ -274,14 +274,14 @@ public actor LocalMTATransport: SMTPTransport {
     private static func raceTerminationAgainstTimeout(
         process: Process,
         stderrBox: NIOLockedBox<[UInt8]>,
-        timeout: Duration
+        timeout: TimeInterval
     ) async throws {
         try await withThrowingTaskGroup(of: Void.self) { race in
             race.addTask {
                 try await Self.awaitTermination(process: process, stderrBox: stderrBox)
             }
             race.addTask {
-                try await Task.sleep(for: timeout)
+                try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
                 if process.isRunning { process.terminate() }
                 throw LocalMTAError.timedOut
             }

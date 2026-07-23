@@ -19,9 +19,9 @@ struct DirectMXRetryQueueTests {
 
     @Test func classifyAppliesTheExactConfiguredBackoffPerReplyClass() {
         let policy = RetryBackoffPolicy(
-            serviceUnavailable: .seconds(111),
-            greylist: .seconds(22),
-            defaultTransient: .seconds(3)
+            serviceUnavailable: 111,
+            greylist: 22,
+            defaultTransient: 3
         )
         let reply421 = SMTPReply(code: 421, lines: ["4.3.2 Service unavailable, closing channel"])
         let reply450 = SMTPReply(code: 450, lines: ["4.2.0 Greylisted, try again later"])
@@ -50,7 +50,7 @@ struct DirectMXRetryQueueTests {
     }
 
     @Test func aPermanentReplyIsNeverBackedOffEvenWithAConfiguredPolicy() {
-        let policy = RetryBackoffPolicy(serviceUnavailable: .seconds(999), greylist: .seconds(999), defaultTransient: .seconds(999))
+        let policy = RetryBackoffPolicy(serviceUnavailable: 999, greylist: 999, defaultTransient: 999)
         let reply550 = SMTPReply(code: 550, lines: ["5.1.1 User unknown"])
         guard case .permanentlyFailed = policy.classify(reply550, attempt: 1) else {
             Issue.record("expected .permanentlyFailed for a 5yz reply regardless of policy")
@@ -63,9 +63,9 @@ struct DirectMXRetryQueueTests {
     @Test func exceedingMaxAttemptsBecomesExpiredNotStuckForever() async throws {
         let collector = OutcomeCollector()
         let config = DirectMXRetryQueue.Configuration(
-            backoff: .init(serviceUnavailable: .milliseconds(5), greylist: .milliseconds(5), defaultTransient: .milliseconds(5)),
+            backoff: .init(serviceUnavailable: 0.005, greylist: 0.005, defaultTransient: 0.005),
             maxAttempts: 2,
-            maxAge: .seconds(3600) // effectively disabled for this test -- only the attempt cap should trigger
+            maxAge: 3600 // effectively disabled for this test -- only the attempt cap should trigger
         )
         // Always comes back greylisted -- a destination that never
         // recovers, the exact scenario the attempt cap exists for.
@@ -111,9 +111,9 @@ struct DirectMXRetryQueueTests {
     @Test func exceedingMaxAgeBecomesExpiredEvenWithAttemptsRemaining() async throws {
         let collector = OutcomeCollector()
         let config = DirectMXRetryQueue.Configuration(
-            backoff: .init(serviceUnavailable: .milliseconds(5), greylist: .milliseconds(5), defaultTransient: .milliseconds(5)),
+            backoff: .init(serviceUnavailable: 0.005, greylist: 0.005, defaultTransient: 0.005),
             maxAttempts: 1000, // effectively disabled -- only maxAge should trigger
-            maxAge: .milliseconds(30)
+            maxAge: 0.03
         )
         let queue = DirectMXRetryQueue(
             configuration: config,
@@ -172,8 +172,8 @@ struct DirectMXRetryQueueTests {
             // below is ever redelivered during this test -- the point is
             // to observe `enqueue`'s own immediate capacity check, not the
             // background loop.
-            backoff: .init(serviceUnavailable: .seconds(3600), greylist: .seconds(3600), defaultTransient: .seconds(3600)),
-            maxAttempts: 10, maxAge: .seconds(3600),
+            backoff: .init(serviceUnavailable: 3600, greylist: 3600, defaultTransient: 3600),
+            maxAttempts: 10, maxAge: 3600,
             maxTotalEntries: 3
         )
         let queue = DirectMXRetryQueue(
@@ -224,7 +224,7 @@ struct DirectMXRetryQueueTests {
         let collector = OutcomeCollector()
         let redeliverCalls = CallCountBox()
         let queue = DirectMXRetryQueue(
-            configuration: .init(backoff: .init(serviceUnavailable: .seconds(3600), greylist: .seconds(3600), defaultTransient: .seconds(3600))),
+            configuration: .init(backoff: .init(serviceUnavailable: 3600, greylist: 3600, defaultTransient: 3600)),
             redeliver: { envelope, _ in
                 await redeliverCalls.increment()
                 return envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
@@ -279,8 +279,8 @@ struct DirectMXRetryQueueTests {
         let collector = OutcomeCollector()
         let attemptsSoFar = CallCountBox()
         let config = DirectMXRetryQueue.Configuration(
-            backoff: .init(serviceUnavailable: .milliseconds(5), greylist: .milliseconds(5), defaultTransient: .milliseconds(5)),
-            maxAttempts: 10, maxAge: .seconds(3600)
+            backoff: .init(serviceUnavailable: 0.005, greylist: 0.005, defaultTransient: 0.005),
+            maxAttempts: 10, maxAge: 3600
         )
         let queue = DirectMXRetryQueue(
             configuration: config,
@@ -323,8 +323,8 @@ struct DirectMXRetryQueueTests {
     @Test func nudgeRestartCancelsThePreviousLoopTaskInsteadOfLeakingAZombie() async throws {
         let collector = OutcomeCollector()
         let config = DirectMXRetryQueue.Configuration(
-            backoff: .init(serviceUnavailable: .milliseconds(1), greylist: .milliseconds(1), defaultTransient: .milliseconds(1)),
-            maxAttempts: 10, maxAge: .seconds(3600)
+            backoff: .init(serviceUnavailable: 0.001, greylist: 0.001, defaultTransient: 0.001),
+            maxAttempts: 10, maxAge: 3600
         )
         let queue = DirectMXRetryQueue(
             configuration: config,
@@ -344,7 +344,7 @@ struct DirectMXRetryQueueTests {
         )
         // Give the loop time to actually start sleeping on entry 1's
         // target before nudging it.
-        try await Task.sleep(for: .milliseconds(20))
+        try await Task.sleep(nanoseconds: UInt64(20) * 1_000_000)
         // Entry 2: due much sooner than entry 1's `nextAttempt` -- forces
         // `nudgeLoop`'s cancel-and-restart branch (not just the
         // fresh-start branch every other test in this file exercises).
@@ -423,7 +423,7 @@ actor OutcomeCollector {
                 }
             }
             group.addTask {
-                try await Task.sleep(for: .seconds(timeoutSeconds))
+                try await Task.sleep(nanoseconds: UInt64(max(0, timeoutSeconds) * 1_000_000_000))
                 throw OutcomeCollectorError.timedOut
             }
             defer { group.cancelAll() }

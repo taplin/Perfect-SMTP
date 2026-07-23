@@ -82,7 +82,7 @@ struct DirectMXTransportTests {
 
         // The RFC 5321 §5.1 implicit-MX fallback must never be attempted
         // for a null-MX domain -- that's the entire point of RFC 7505.
-        try await Task.sleep(for: .milliseconds(10))
+        try await Task.sleep(nanoseconds: UInt64(10) * 1_000_000)
         #expect(await resolveAddressesCalls.count == 0)
     }
 
@@ -175,7 +175,7 @@ struct DirectMXTransportTests {
         // about (breaker-driven host fallback, not TLS-mode selection).
         let config = DirectMXConfig(
             tlsPolicy: .fixed(.none),
-            pool: .init(maxPerHost: 4, maxTotal: 100, circuitBreakerThreshold: threshold, circuitBreakerResetTimeout: .seconds(30))
+            pool: .init(maxPerHost: 4, maxTotal: 100, circuitBreakerThreshold: threshold, circuitBreakerResetTimeout: 30)
         )
         let transport = DirectMXTransport(resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(), dialer: dialer)
 
@@ -205,7 +205,7 @@ struct DirectMXTransportTests {
             "alldown.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.alldown.example")]
         ])
         let threshold = 2
-        let config = DirectMXConfig(pool: .init(circuitBreakerThreshold: threshold, circuitBreakerResetTimeout: .seconds(30)))
+        let config = DirectMXConfig(pool: .init(circuitBreakerThreshold: threshold, circuitBreakerResetTimeout: 30))
         let transport = DirectMXTransport(
             resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(),
             dialer: failingDialer(label: "always down")
@@ -327,7 +327,7 @@ struct DirectMXTransportTests {
         // the first, which the opportunistic default's second (`.none`)
         // candidate key would trigger after the first (`.startTLS`) key's
         // breaker trips, for reasons unrelated to what this test covers.
-        let config = DirectMXConfig(tlsPolicy: .fixed(.none), pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: .seconds(30)))
+        let config = DirectMXConfig(tlsPolicy: .fixed(.none), pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: 30))
         let transport = DirectMXTransport(resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(), dialer: dialer)
 
         let r1 = try await transport.send(try envelope(recipients: ["a@goesambiguous.example"]), message())
@@ -377,7 +377,7 @@ struct DirectMXTransportTests {
             // second MAIL FROM no scripted task is listening for) would
             // make this test hang, rather than letting it stall for the
             // full 300s production default.
-            let (connection, channel) = try await ConnectionHarness.make(replyTimeout: .seconds(2))
+            let (connection, channel) = try await ConnectionHarness.make(replyTimeout: 2)
             Task {
                 guard let ehlo = try? await expectClientLine(channel), ehlo.hasPrefix("EHLO") else { return }
                 try? await serverSend(channel, "250 mx.goes421.example Hello")
@@ -404,7 +404,7 @@ struct DirectMXTransportTests {
         // sensitive, which the opportunistic default's second candidate
         // key would perturb for reasons unrelated to what this test
         // covers (421 feeding the breaker and not idling the connection).
-        let config = DirectMXConfig(tlsPolicy: .fixed(.none), pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: .seconds(30)))
+        let config = DirectMXConfig(tlsPolicy: .fixed(.none), pool: .init(circuitBreakerThreshold: 1, circuitBreakerResetTimeout: 30))
         let transport = DirectMXTransport(resolver: resolver, config: config, group: NIOAsyncTestingEventLoop(), dialer: dialer)
 
         let r1 = try await transport.send(try envelope(recipients: ["a@goes421.example"]), message())

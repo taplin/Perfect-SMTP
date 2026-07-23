@@ -142,8 +142,8 @@ public struct DirectMXConfig: Sendable {
     /// domains should likely raise it above the Phase-1 default (32).
     public var pool: SMTPConnectionPool.Configuration
     public var connectTimeout: TimeAmount
-    public var replyTimeout: Duration
-    public var dataTerminationTimeout: Duration
+    public var replyTimeout: TimeInterval
+    public var dataTerminationTimeout: TimeInterval
     /// FIX #2 (milestone security review): SSRF-class filtering is
     /// default-**on** -- every resolved `DNSAddress` is checked against
     /// `DNSAddress.isRoutable` (private/loopback/link-local/unique-local/
@@ -161,8 +161,8 @@ public struct DirectMXConfig: Sendable {
         ehloHostname: String = "localhost",
         pool: SMTPConnectionPool.Configuration = .init(),
         connectTimeout: TimeAmount = .seconds(30),
-        replyTimeout: Duration = .seconds(300),
-        dataTerminationTimeout: Duration = .seconds(600),
+        replyTimeout: TimeInterval = 300,
+        dataTerminationTimeout: TimeInterval = 600,
         allowPrivateAddresses: Bool = false
     ) {
         self.port = port

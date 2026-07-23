@@ -67,7 +67,7 @@ struct DirectMXOpportunisticTLSTests {
         // out on this particular run.
         let transport = DirectMXTransport(
             resolver: resolver,
-            config: DirectMXConfig(port: server.port, replyTimeout: .seconds(2), allowPrivateAddresses: true),
+            config: DirectMXConfig(port: server.port, replyTimeout: 2, allowPrivateAddresses: true),
             group: group
         )
 
@@ -191,7 +191,7 @@ struct DirectMXOpportunisticTLSTests {
             resolver: resolver,
             config: DirectMXConfig(
                 port: server.port,
-                pool: .init(circuitBreakerThreshold: 5, circuitBreakerResetTimeout: .seconds(60)),
+                pool: .init(circuitBreakerThreshold: 5, circuitBreakerResetTimeout: 60),
                 allowPrivateAddresses: true
             ),
             group: group

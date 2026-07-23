@@ -134,7 +134,7 @@ private struct CountingTransport: SMTPTransport {
     func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
         await tracker.enter()
         do {
-            try await Task.sleep(for: .milliseconds(5))
+            try await Task.sleep(nanoseconds: UInt64(5) * 1_000_000)
         } catch {
             await tracker.exit()
             throw error

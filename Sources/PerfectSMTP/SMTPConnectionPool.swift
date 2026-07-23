@@ -42,31 +42,31 @@ public actor SMTPConnectionPool {
     public struct Configuration: Sendable {
         public var maxPerHost: Int
         public var maxTotal: Int
-        public var idleTimeout: Duration
+        public var idleTimeout: TimeInterval
         public var connectTimeout: TimeAmount
         public var circuitBreakerThreshold: Int
-        public var circuitBreakerResetTimeout: Duration
+        public var circuitBreakerResetTimeout: TimeInterval
         /// FIX #4 (plan §7, milestone architecture review): per-command
         /// reply/write timeout threaded into every pool-dialed
         /// `SMTPConnection`, so a hung/black-holed remote server can't pin
         /// a pooled connection indefinitely (see `SMTPConnection`'s own
         /// doc comments). RFC 5321 §4.5.3.2's general per-command minimum.
-        public var replyTimeout: Duration
+        public var replyTimeout: TimeInterval
         /// FIX #4's phase-specific exception: RFC 5321 §4.5.3.2's longer
         /// minimum specifically for the final reply after the DATA
         /// terminator, where the server may legitimately be doing real
         /// work (spooling/scanning a large message).
-        public var dataTerminationTimeout: Duration
+        public var dataTerminationTimeout: TimeInterval
 
         public init(
             maxPerHost: Int = 4,
             maxTotal: Int = 32,
-            idleTimeout: Duration = .seconds(60),
+            idleTimeout: TimeInterval = 60,
             connectTimeout: TimeAmount = .seconds(30),
             circuitBreakerThreshold: Int = 5,
-            circuitBreakerResetTimeout: Duration = .seconds(30),
-            replyTimeout: Duration = .seconds(300),
-            dataTerminationTimeout: Duration = .seconds(600)
+            circuitBreakerResetTimeout: TimeInterval = 30,
+            replyTimeout: TimeInterval = 300,
+            dataTerminationTimeout: TimeInterval = 600
         ) {
             self.maxPerHost = maxPerHost
             self.maxTotal = maxTotal
@@ -132,12 +132,12 @@ public actor SMTPConnectionPool {
 
     private struct IdleEntry {
         let connection: SMTPConnection
-        let returnedAt: ContinuousClock.Instant
+        let returnedAt: DispatchTime
     }
 
     private enum BreakerState {
         case closed(consecutiveFailures: Int)
-        case open(until: ContinuousClock.Instant)
+        case open(until: DispatchTime)
     }
 
     private var idle: [Key: [IdleEntry]] = [:]
@@ -153,7 +153,14 @@ public actor SMTPConnectionPool {
     /// `maxPerHost = 1` without a real socket). Defaults to the real
     /// `SMTPBootstrap`-backed dialer.
     private let dialer: @Sendable (Key) async throws -> SMTPConnection
-    private let clock = ContinuousClock()
+
+    /// `DispatchTime` (not `ContinuousClock`, for macOS 13.0-independence
+    /// -- see `Documentation/macos-deployment-targets.md`'s 13.0 baseline)
+    /// -- same wall-clock-adjustment immunity `ContinuousClock` provided,
+    /// just via an older, more verbose API.
+    private static func dispatchDeadline(secondsFromNow: TimeInterval) -> DispatchTime {
+        DispatchTime(uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0, secondsFromNow) * 1_000_000_000))
+    }
 
     public init(configuration: Configuration = .init(), ehloHostname: String = "localhost", group: any EventLoopGroup) {
         self.configuration = configuration
@@ -289,8 +296,9 @@ public actor SMTPConnectionPool {
         var result: SMTPConnection?
         while !list.isEmpty {
             let entry = list.removeFirst()
-            let age = clock.now - entry.returnedAt
-            if age > configuration.idleTimeout || !entry.connection.channel.isActive {
+            let ageNanoseconds = DispatchTime.now().uptimeNanoseconds &- entry.returnedAt.uptimeNanoseconds
+            let ageSeconds = TimeInterval(ageNanoseconds) / 1_000_000_000
+            if ageSeconds > configuration.idleTimeout || !entry.connection.channel.isActive {
                 entry.connection.channel.close(promise: nil)
                 continue
             }
@@ -361,7 +369,7 @@ public actor SMTPConnectionPool {
             recordSuccess(key)
             if handOff(key, outcome: .connection(connection)) { return }
             activeCount[key, default: 1] -= 1
-            idle[key, default: []].append(IdleEntry(connection: connection, returnedAt: clock.now))
+            idle[key, default: []].append(IdleEntry(connection: connection, returnedAt: DispatchTime.now()))
             return
         }
         if !healthy { recordFailure(key) } else { recordSuccess(key) }
@@ -394,7 +402,7 @@ public actor SMTPConnectionPool {
         case .closed:
             return
         case .open(let until):
-            if clock.now >= until {
+            if DispatchTime.now() >= until {
                 breaker[key] = .closed(consecutiveFailures: 0)
             } else {
                 throw SMTPError.circuitOpen
@@ -407,7 +415,7 @@ public actor SMTPConnectionPool {
         if case .closed(let n) = breaker[key] ?? .closed(consecutiveFailures: 0) { current = n } else { current = 0 }
         let next = current + 1
         breaker[key] = next >= configuration.circuitBreakerThreshold
-            ? .open(until: clock.now + configuration.circuitBreakerResetTimeout)
+            ? .open(until: Self.dispatchDeadline(secondsFromNow: configuration.circuitBreakerResetTimeout))
             : .closed(consecutiveFailures: next)
     }
 

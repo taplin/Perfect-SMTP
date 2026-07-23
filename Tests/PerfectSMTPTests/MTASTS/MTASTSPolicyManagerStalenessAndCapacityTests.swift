@@ -44,7 +44,7 @@ struct MTASTSPolicyManagerStalenessAndCapacityTests {
         let clock = MutableClock()
         let manager = MTASTSPolicyManager(
             dnsResolver: dns, httpFetcher: http,
-            configuration: .init(staleCacheCeiling: .seconds(5)),
+            configuration: .init(staleCacheCeiling: 5),
             now: clock.now
         )
 
@@ -67,7 +67,7 @@ struct MTASTSPolicyManagerStalenessAndCapacityTests {
         let clock = MutableClock()
         let manager = MTASTSPolicyManager(
             dnsResolver: dns, httpFetcher: http,
-            configuration: .init(staleCacheCeiling: .seconds(5)),
+            configuration: .init(staleCacheCeiling: 5),
             now: clock.now
         )
 

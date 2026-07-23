@@ -90,7 +90,7 @@ struct STARTTLSRealSocketTests {
                 completed = true
                 break
             }
-            try? await Task.sleep(for: .milliseconds(100))
+            try? await Task.sleep(nanoseconds: UInt64(100) * 1_000_000)
         }
 
         try? await server.channel.close()

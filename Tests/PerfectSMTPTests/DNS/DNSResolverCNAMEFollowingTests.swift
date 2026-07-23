@@ -14,6 +14,7 @@
 //  query loop to exercise.
 //
 
+import Foundation
 import NIOPosix
 import Testing
 @testable import PerfectSMTP
@@ -56,18 +57,17 @@ struct DNSResolverCNAMEFollowingTests {
 
         let resolver = DNSResolver(nameservers: [server.nameserver], group: group, queryTimeout: .seconds(2))
 
-        let clock = ContinuousClock()
-        let start = clock.now
+        let start = DispatchTime.now()
         await #expect(throws: DNSResolver.ResolveError.cnameLoop) {
             _ = try await resolver.resolveAddressesOfType(.a, name: "a.loop.test")
         }
-        let elapsed = clock.now - start
+        let elapsedSeconds = TimeInterval(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000_000
         // The cycle is caught the moment "a.loop.test" is revisited (the
         // third hop: a -> b -> a) -- three fast local queries, not
         // anywhere close to `queryTimeout`'s 2s budget. A regression that
         // turned this into a hang (or fell through to exhausting the
         // 8-hop bound via repeated timeouts) would blow well past this.
-        #expect(elapsed < .seconds(1), "cycle detection took \(elapsed) -- expected it to be caught almost immediately via the visited-name guard, not by exhausting retries/hops")
+        #expect(elapsedSeconds < 1, "cycle detection took \(elapsedSeconds)s -- expected it to be caught almost immediately via the visited-name guard, not by exhausting retries/hops")
     }
 
     @Test func aChainLongerThanTheHopBoundIsRejectedWithoutACycle() async throws {

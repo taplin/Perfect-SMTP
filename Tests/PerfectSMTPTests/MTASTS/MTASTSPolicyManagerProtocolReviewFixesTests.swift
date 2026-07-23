@@ -63,7 +63,7 @@ struct MTASTSPolicyManagerProtocolReviewFixesTests {
         let clock = MutableClock()
         let manager = MTASTSPolicyManager(
             dnsResolver: dns, httpFetcher: http,
-            configuration: .init(idRecheckInterval: .seconds(60)),
+            configuration: .init(idRecheckInterval: 60),
             now: clock.now
         )
 
@@ -95,7 +95,7 @@ struct MTASTSPolicyManagerProtocolReviewFixesTests {
         let clock = MutableClock()
         let manager = MTASTSPolicyManager(
             dnsResolver: dns, httpFetcher: http,
-            configuration: .init(idRecheckInterval: .seconds(60)),
+            configuration: .init(idRecheckInterval: 60),
             now: clock.now
         )
 
@@ -122,7 +122,7 @@ struct MTASTSPolicyManagerProtocolReviewFixesTests {
         let clock = MutableClock()
         let manager = MTASTSPolicyManager(
             dnsResolver: dns, httpFetcher: http,
-            configuration: .init(idRecheckInterval: .seconds(60)),
+            configuration: .init(idRecheckInterval: 60),
             now: clock.now
         )
 

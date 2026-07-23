@@ -79,7 +79,7 @@ enum DNSTransport {
                 } catch let error as DNSResolver.ResolveError where error == .timeout {
                     lastError = error
                     if attempt + 1 < maximumUDPAttemptsPerNameserver {
-                        try? await Task.sleep(for: .milliseconds(udpRetryBackoffUnit * Int64(attempt + 1)))
+                        try? await Task.sleep(nanoseconds: UInt64(udpRetryBackoffUnit * Int64(attempt + 1)) * 1_000_000)
                     }
                     continue // retry the same nameserver
                 } catch {
@@ -218,7 +218,7 @@ enum DNSTransport {
         try await withThrowingTaskGroup(of: T.self) { race in
             race.addTask { try await operation() }
             race.addTask {
-                try await Task.sleep(for: .nanoseconds(timeout.nanoseconds))
+                try await Task.sleep(nanoseconds: UInt64(max(0, timeout.nanoseconds)))
                 throw DNSResolver.ResolveError.timeout
             }
             defer { race.cancelAll() }

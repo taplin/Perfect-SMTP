@@ -74,7 +74,7 @@ struct DirectMXMTASTSEnforceTests {
             ]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "enforce.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx2.enforce.example"], maxAge: .seconds(86400)),
+            "enforce.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx2.enforce.example"], maxAge: 86400),
         ])
         let succeedingHost = scriptedDialer()
         let mismatchedHostWasDialed = CallCountBox()
@@ -111,7 +111,7 @@ struct DirectMXMTASTSEnforceTests {
             "nomatch.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx1.nomatch.example")]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "nomatch.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx9.completely-different.example"], maxAge: .seconds(86400)),
+            "nomatch.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx9.completely-different.example"], maxAge: 86400),
         ])
         // Any dial attempt at all is a bug for this test -- with zero
         // policy-matching hosts, `enforce` mode must hard-fail before ever
@@ -139,7 +139,7 @@ struct DirectMXMTASTSEnforceTests {
             "tlsfail.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.tlsfail.example")]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "tlsfail.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx.tlsfail.example"], maxAge: .seconds(86400)),
+            "tlsfail.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx.tlsfail.example"], maxAge: 86400),
         ])
         let plaintextWasAttempted = CallCountBox()
         let dialer: @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection = { key in
@@ -172,7 +172,7 @@ struct DirectMXMTASTSEnforceTests {
             "works.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.works.example")]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "works.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx.works.example"], maxAge: .seconds(86400)),
+            "works.example": MTASTSPolicy(mode: .enforce, mxPatterns: ["mx.works.example"], maxAge: 86400),
         ])
         let succeedingHost = scriptedDialer()
         let dialer: @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection = { key in
@@ -202,7 +202,7 @@ struct DirectMXMTASTSEnforceTests {
             ]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "testing.example": MTASTSPolicy(mode: .testing, mxPatterns: ["mx1.testing.example"], maxAge: .seconds(86400)),
+            "testing.example": MTASTSPolicy(mode: .testing, mxPatterns: ["mx1.testing.example"], maxAge: 86400),
         ])
         let succeedingHost = scriptedDialer()
         let dialer: @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection = { key in
@@ -238,7 +238,7 @@ struct DirectMXMTASTSEnforceTests {
             "testingworks.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.testingworks.example")]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "testingworks.example": MTASTSPolicy(mode: .testing, mxPatterns: ["mx.testingworks.example"], maxAge: .seconds(86400)),
+            "testingworks.example": MTASTSPolicy(mode: .testing, mxPatterns: ["mx.testingworks.example"], maxAge: 86400),
         ])
         let succeedingHost = scriptedDialer()
         let dialer: @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection = { key in
@@ -290,7 +290,7 @@ struct DirectMXMTASTSEnforceTests {
             "modenone.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.modenone.example")]
         ])
         let policyProvider = FakeMTASTSPolicyProvider(policiesByDomain: [
-            "modenone.example": MTASTSPolicy(mode: .none, mxPatterns: [], maxAge: .seconds(86400)),
+            "modenone.example": MTASTSPolicy(mode: .none, mxPatterns: [], maxAge: 86400),
         ])
         let succeedingHost = scriptedDialer()
         let dialer: @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection = { key in
